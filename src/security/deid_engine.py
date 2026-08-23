@@ -1,104 +1,84 @@
-# src/security/deid_engine.py
-
-import hashlib
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, udf, date_add, when
-from pyspark.sql.types import StringType, DateType
-import datetime
-import random
+from pyspark.sql.functions import col, sha2, date_add, udf, regexp_replace, expr
+from pyspark.sql.types import StringType
+import re
+import sys
 
-def get_spark_session():
+def get_spark_session(app_name="PHI_DeID_Engine"):
     return SparkSession.builder \
-        .appName("PHI_Deidentification_Engine") \
+        .appName(app_name) \
         .getOrCreate()
 
-# Simulated Format-Preserving Encryption (FPE) for SSN/MRN
-# In production, use Protegrity, Voltage, or AWS Macie integration
-import os
-def fpe_encrypt(value, secret_key=None):
-    if secret_key is None:
-        secret_key = os.environ.get("HIPAA_SECRET_KEY", "")
-    if not value:
-        return None
-    # A simple deterministic hash simulation for FPE
-    hasher = hashlib.sha256()
-    hasher.update(f"{value}_{secret_key}".encode('utf-8'))
-    # Return a mocked FPE-like string (e.g., preserving length/format conceptually)
-    # Here we just return a deterministic hex for demonstration
-    return hasher.hexdigest()[:len(str(value))]
+# Simulated Format-Preserving Encryption (FPE) using SHA-256 for demonstration
+# In reality, you would use a dedicated FPE library that maintains format (e.g. NIST FF1/FF3)
+def simulate_fpe(value):
+    if not value: return value
+    import hashlib
+    # Simple hash for demo
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()[:len(value)]
 
-fpe_encrypt_udf = udf(fpe_encrypt, StringType())
+fpe_udf = udf(simulate_fpe, StringType())
 
-# Deterministic date shifting
-def get_date_shift_offset(patient_id, secret_key=None):
-    if secret_key is None:
-        secret_key = os.environ.get("HIPAA_SECRET_KEY", "")
-    if not patient_id:
-        return 0
-    # Deterministic offset between -30 and +30 days
-    hasher = hashlib.md5()
-    hasher.update(f"{patient_id}_{secret_key}".encode('utf-8'))
-    hash_int = int(hasher.hexdigest(), 16)
-    return (hash_int % 61) - 30
+def safe_harbor_redact(text_col):
+    # Regex to redact potential phone numbers or SSNs from free text (Safe Harbor 18)
+    pattern = r'\b(\d{3}-\d{2}-\d{4}|\d{3}-\d{3}-\d{4})\b'
+    return regexp_replace(text_col, pattern, '[REDACTED]')
 
-get_date_shift_offset_udf = udf(get_date_shift_offset, StringType())
+def deterministic_shift_days(patient_id):
+    if not patient_id: return 0
+    import hashlib
+    # Modulo arithmetic to generate a shift between -30 and 30 days based on patient_id
+    hash_val = int(hashlib.md5(patient_id.encode('utf-8')).hexdigest(), 16)
+    return (hash_val % 61) - 30
 
-# Safe Harbor 18 free-text redaction simulation
-def redact_free_text(text):
-    if not text:
-        return None
-    # Simulate finding and redacting PHI
-    # In production, NLP models (e.g., AWS Comprehend Medical) would be used
-    redacted = str(text).replace("John", "[REDACTED_NAME]").replace("Doe", "[REDACTED_NAME]")
-    return redacted
+shift_udf = udf(deterministic_shift_days, StringType())
 
-redact_free_text_udf = udf(redact_free_text, StringType())
-
-
-def process_deid(spark, input_table, output_table):
+def apply_deid_rules(df, patient_id_col, ssn_col, mrn_col, dob_col, notes_col):
     """
-    Applies de-identification rules to a DataFrame.
-    Assumes standard columns exist for demonstration: patient_id, ssn, mrn, birth_date, clinical_notes
+    Applies de-identification rules:
+    - FPE on SSN and MRN
+    - Deterministic date-shifting (+/- 30 days) on DOB based on Patient ID
+    - Safe Harbor 18 redaction on Notes
     """
-    df_raw = spark.table(input_table)
+    if ssn_col in df.columns:
+        df = df.withColumn(f"{ssn_col}_deid", fpe_udf(col(ssn_col)))
 
-    # Check if necessary columns exist before applying (robustness)
-    cols = df_raw.columns
+    if mrn_col in df.columns:
+        df = df.withColumn(f"{mrn_col}_deid", fpe_udf(col(mrn_col)))
 
-    df_deid = df_raw
+    if dob_col in df.columns and patient_id_col in df.columns:
+        # Deterministic Date shift: +/- 30 days based on patient ID
+        df = df.withColumn("shift_days", shift_udf(col(patient_id_col)).cast("int"))
+        df = df.withColumn(f"{dob_col}_deid", expr(f"date_add({dob_col}, shift_days)"))
+        df = df.drop("shift_days")
 
-    if 'patient_id' in cols:
-        # Calculate date shift offset based on patient ID
-        df_deid = df_deid.withColumn("date_shift_offset", get_date_shift_offset_udf(col("patient_id")).cast("int"))
+    if notes_col in df.columns:
+        df = df.withColumn(f"{notes_col}_deid", safe_harbor_redact(col(notes_col)))
 
-        if 'birth_date' in cols:
-             df_deid = df_deid.withColumn("birth_date",
-                                          when(col("birth_date").isNotNull(),
-                                               date_add(col("birth_date"), col("date_shift_offset")))
-                                          .otherwise(col("birth_date")))
-        if 'ssn' in cols:
-             df_deid = df_deid.withColumn("ssn", fpe_encrypt_udf(col("ssn")))
+    return df
 
-        if 'mrn' in cols:
-             df_deid = df_deid.withColumn("mrn", fpe_encrypt_udf(col("mrn")))
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: deid_engine.py <input_table> <output_table>")
+        sys.exit(1)
 
-        if 'clinical_notes' in cols:
-             df_deid = df_deid.withColumn("clinical_notes", redact_free_text_udf(col("clinical_notes")))
+    input_table = sys.argv[1]
+    output_table = sys.argv[2]
 
-        # Drop the temporary offset column
-        df_deid = df_deid.drop("date_shift_offset")
-
-    # Write to De-identified Silver table
-    df_deid.write \
-        .format("iceberg") \
-        .mode("append") \
-        .saveAsTable(output_table)
-
-if __name__ == "__main__":
     spark = get_spark_session()
 
-    # Assume a parsed Bronze or raw Silver table with extracted fields
-    INPUT_TABLE = "glue_catalog.silver.parsed_patients_raw"
-    OUTPUT_TABLE = "glue_catalog.silver.deidentified_patients"
+    df = spark.read.table(input_table)
 
-    process_deid(spark, INPUT_TABLE, OUTPUT_TABLE)
+    # Assume schema has patient_id, ssn, mrn, dob, clinical_notes columns
+    df_deid = apply_deid_rules(df, "patient_id", "ssn", "mrn", "dob", "clinical_notes")
+
+    # Save the de-identified dataframe
+    df_deid.write \
+        .format("iceberg") \
+        .mode("overwrite") \
+        .saveAsTable(output_table)
+
+    print(f"De-identification complete. Output written to {output_table}")
+
+if __name__ == "__main__":
+    main()

@@ -1,19 +1,12 @@
-# dags/ehdip_orchestration_dag.py
-
 from airflow import DAG
-from airflow.providers.amazon.aws.operators.emr import EmrServerlessStartJobRunOperator
-from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
+from airflow.providers.amazon.aws.operators.emr import EmrServerlessStartJobOperator
+from airflow.providers.dbt.cloud.operators.dbt import DbtCloudRunJobOperator
 from airflow.utils.dates import days_ago
 from datetime import timedelta
 
-from airflow.operators.bash import BashOperator
-# In a real Airflow environment with OpenLineage, you'd set up the provider.
-# from airflow.providers.openlineage.extractors import ...
-
-
-# Default arguments for DAG
+# Default args with OpenLineage enabled inherently via Airflow configuration
 default_args = {
-    'owner': 'ehdip_data_eng',
+    'owner': 'data_engineering',
     'depends_on_past': False,
     'email_on_failure': True,
     'email_on_retry': False,
@@ -21,85 +14,102 @@ default_args = {
     'retry_delay': timedelta(minutes=5),
 }
 
-# Define DAG
 with DAG(
-    'ehdip_end_to_end_pipeline',
+    'ehdip_end_to_end_orchestration',
     default_args=default_args,
-    description='EHDIP Medallion Architecture Orchestration',
-    schedule_interval=timedelta(hours=1),
+    description='EHDIP Batch Pipeline: Raw -> Bronze -> Silver (OMOP) -> Gold (dbt)',
+    schedule_interval='@daily',
     start_date=days_ago(1),
     catchup=False,
-    tags=['ehdip', 'production', 'iceberg', 'snowflake'],
+    tags=['ehdip', 'hipaa', 'production'],
 ) as dag:
 
-    # 1. Batch Ingestion (X12 EDI) -> Bronze
-    ingest_x12_bronze = EmrServerlessStartJobRunOperator(
-        task_id='ingest_x12_to_bronze',
-        application_id='app-12345xxxxxx',
-        execution_role_arn='arn:aws:iam::123456789012:role/EMR_Serverless_Execution_Role',
+    # 1. Ingestion (Batch X12)
+    ingest_x12 = EmrServerlessStartJobOperator(
+        task_id='ingest_x12_batch',
+        application_id='app-xxxxx',
+        execution_role_arn='arn:aws:iam::123456789012:role/EMRServerlessExecutionRole',
         job_driver={
             'sparkSubmit': {
-                'entryPoint': 's3://ehdip-scripts/ingestion/x12_batch_parser.py',
+                'entryPoint': 's3://ehdip-artifacts/scripts/x12_batch_parser.py',
+                'entryPointArguments': ['s3://ehdip-raw-landing/x12/inbound/']
             }
         },
+        name='ehdip_ingest_x12'
     )
 
-    # 2. CDC Ingestion -> Bronze
-    ingest_cdc_bronze = EmrServerlessStartJobRunOperator(
-        task_id='ingest_cdc_to_bronze',
-        application_id='app-12345xxxxxx',
-        execution_role_arn='arn:aws:iam::123456789012:role/EMR_Serverless_Execution_Role',
+    # 1b. Ingestion (Batch CDC)
+    ingest_cdc = EmrServerlessStartJobOperator(
+        task_id='ingest_cdc_batch',
+        application_id='app-xxxxx',
+        execution_role_arn='arn:aws:iam::123456789012:role/EMRServerlessExecutionRole',
         job_driver={
             'sparkSubmit': {
-                'entryPoint': 's3://ehdip-scripts/ingestion/cdc_consumer.py',
+                'entryPoint': 's3://ehdip-artifacts/scripts/cdc_consumer.py',
+                'entryPointArguments': ['s3://ehdip-raw-landing/cdc/inbound/']
             }
         },
+        name='ehdip_ingest_cdc'
     )
 
-    # 3. De-Identification Engine (Bronze -> Silver)
-    run_deid_engine = EmrServerlessStartJobRunOperator(
-        task_id='run_phi_deidentification',
-        application_id='app-12345xxxxxx',
-        execution_role_arn='arn:aws:iam::123456789012:role/EMR_Serverless_Execution_Role',
+    # 2. De-identification (FPE, Date Shift)
+    deid_phi = EmrServerlessStartJobOperator(
+        task_id='deidentify_phi',
+        application_id='app-xxxxx',
+        execution_role_arn='arn:aws:iam::123456789012:role/EMRServerlessExecutionRole',
         job_driver={
             'sparkSubmit': {
-                'entryPoint': 's3://ehdip-scripts/security/deid_engine.py',
+                'entryPoint': 's3://ehdip-artifacts/scripts/deid_engine.py'
             }
         },
+        name='ehdip_deid'
     )
 
-    # 4. Data Quality & DLQ Routing
-    run_dq_checks = EmrServerlessStartJobRunOperator(
-        task_id='run_dq_circuit_breaker',
-        application_id='app-12345xxxxxx',
-        execution_role_arn='arn:aws:iam::123456789012:role/EMR_Serverless_Execution_Role',
+    # 3. Quality validation and DLQ routing
+    data_quality_check = EmrServerlessStartJobOperator(
+        task_id='data_quality_validation',
+        application_id='app-xxxxx',
+        execution_role_arn='arn:aws:iam::123456789012:role/EMRServerlessExecutionRole',
         job_driver={
             'sparkSubmit': {
-                'entryPoint': 's3://ehdip-scripts/quality/dq_circuit_breaker.py',
+                'entryPoint': 's3://ehdip-artifacts/scripts/dq_circuit_breaker.py'
             }
         },
+        name='ehdip_dq'
     )
 
-    # 5. Silver OMOP Transformation
-    transform_omop_silver = EmrServerlessStartJobRunOperator(
-        task_id='transform_to_omop_silver',
-        application_id='app-12345xxxxxx',
-        execution_role_arn='arn:aws:iam::123456789012:role/EMR_Serverless_Execution_Role',
+    # 4. Silver Transformation (OMOP Mapping & Upsert)
+    silver_omop_transform = EmrServerlessStartJobOperator(
+        task_id='silver_omop_transformation',
+        application_id='app-xxxxx',
+        execution_role_arn='arn:aws:iam::123456789012:role/EMRServerlessExecutionRole',
         job_driver={
             'sparkSubmit': {
-                'entryPoint': 's3://ehdip-scripts/transformation/omop_silver_transformer.py',
+                'entryPoint': 's3://ehdip-artifacts/scripts/omop_silver_transformer.py'
             }
         },
+        name='ehdip_silver_omop'
     )
 
-
-    # 6. Trigger dbt models for Gold Marts
-    run_dbt_gold_marts = BashOperator(
-        task_id='run_dbt_gold_marts',
-        bash_command='dbt run --models gold.* --profiles-dir /usr/local/airflow/dbt',
-        env={'OPENLINEAGE_URL': 'http://openlineage:5000', 'OPENLINEAGE_NAMESPACE': 'ehdip_prod'},
+    # 5. Silver Incremental Merge
+    silver_incremental_merge = EmrServerlessStartJobOperator(
+        task_id='silver_incremental_merge',
+        application_id='app-xxxxx',
+        execution_role_arn='arn:aws:iam::123456789012:role/EMRServerlessExecutionRole',
+        job_driver={
+            'sparkSubmit': {
+                'entryPoint': 's3://ehdip-artifacts/scripts/incremental_merge.py'
+            }
+        },
+        name='ehdip_silver_merge'
     )
 
+    # 6. dbt Gold Marts Execution (via Snowflake)
+    run_dbt_gold_marts = DbtCloudRunJobOperator(
+        task_id='run_dbt_gold_models',
+        dbt_cloud_conn_id='dbt_cloud_default',
+        job_id=12345
+    )
 
-    # Define Dependencies
-    [ingest_x12_bronze, ingest_cdc_bronze] >> run_deid_engine >> run_dq_checks >> transform_omop_silver >> run_dbt_gold_marts
+    # DAG Dependencies
+    [ingest_x12, ingest_cdc] >> deid_phi >> data_quality_check >> silver_omop_transform >> silver_incremental_merge >> run_dbt_gold_marts

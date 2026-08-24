@@ -1,63 +1,43 @@
-# src/transformation/omop_silver_transformer.py
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import col, lit, current_timestamp
 
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, current_timestamp, coalesce
-
-def get_spark_session():
-    return SparkSession.builder \
-        .appName("OMOP_Silver_Transformation") \
-        .getOrCreate()
-
-def transform_to_omop_condition(spark, input_table, vocab_table, output_table):
-    """
-    Transforms de-identified events to OMOP CDM v5.4 condition_occurrence table.
-    """
-    df_deid = spark.table(input_table)
-    df_vocab = spark.table(vocab_table)
-
-    # Example Transformation Logic for Condition Occurrence
-    # Assuming df_deid has: patient_id, encounter_id, condition_code, condition_date
-    # Assuming df_vocab has: concept_code, concept_id (where domain_id = 'Condition')
-
-    # 1. Join with vocabulary to get concept_id
-    df_mapped = df_deid.join(
-        df_vocab,
-        df_deid.condition_code == df_vocab.concept_code,
-        "left"
-    )
-
-    # 2. Map to OMOP schema
-    df_omop_condition = df_mapped.select(
-        # OMOP usually generates a surrogate key here, we simulate it with an expression in practice
-        # For PySpark, monotonically_increasing_id() can be used or a UUID cast
-        col("patient_id").alias("person_id"), # In a real scenario, mapped to OMOP person_id integer
-        coalesce(col("concept_id"), lit(0)).alias("condition_concept_id"), # 0 for unmapped
-        col("condition_date").alias("condition_start_date"),
-        col("condition_date").alias("condition_start_datetime"),
+def transform_to_omop_condition(deid_df: DataFrame) -> DataFrame:
+    """Maps de-identified raw events to OMOP condition_occurrence table."""
+    # Simplified mapping assuming the source DataFrame has standard abstracted columns
+    # In reality, this would involve Athena vocabulary joins (concept_id lookups)
+    return deid_df.select(
+        col("payload_id").alias("condition_occurrence_id"),
+        col("patient_id").alias("person_id"),
+        col("condition_concept_id"),
+        col("encounter_date_shifted").alias("condition_start_date"),
+        col("encounter_date_shifted").alias("condition_start_datetime"),
         lit(None).cast("date").alias("condition_end_date"),
         lit(None).cast("timestamp").alias("condition_end_datetime"),
-        lit(32020).alias("condition_type_concept_id"), # 32020: EHR encounter diagnosis
+        lit(32020).alias("condition_type_concept_id"), # e.g., EHR encounter diagnosis
         lit(None).cast("string").alias("stop_reason"),
-        lit(None).cast("int").alias("provider_id"),
+        lit(None).cast("integer").alias("provider_id"),
         col("encounter_id").alias("visit_occurrence_id"),
-        lit(None).cast("int").alias("visit_detail_id"),
-        col("condition_code").alias("condition_source_value"),
-        coalesce(col("concept_id"), lit(0)).alias("condition_source_concept_id"),
+        lit(None).cast("integer").alias("visit_detail_id"),
+        col("condition_source_value"),
+        col("condition_source_concept_id"),
         lit(None).cast("string").alias("condition_status_source_value"),
-        lit(None).cast("int").alias("condition_status_concept_id")
-    ).withColumn("created_at", current_timestamp())
+        lit(None).cast("integer").alias("condition_status_concept_id")
+    ).withColumn("transformed_at", current_timestamp())
 
-    # 3. Write to Silver Iceberg Table
-    df_omop_condition.write \
-        .format("iceberg") \
-        .mode("append") \
-        .saveAsTable(output_table)
+def run_silver_transformation():
+    spark = SparkSession.builder \
+        .appName("EHDIP_OMOP_Silver_Transformer") \
+        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
+        .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
+        .config("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO") \
+        .getOrCreate()
+
+    # Read from Bronze (post de-id)
+    deid_df = spark.read.table("glue_catalog.ehdip_bronze.deidentified_payloads")
+
+    transform_to_omop_condition(deid_df).write.format("iceberg").mode("append").saveAsTable("glue_catalog.ehdip_silver.condition_occurrence")
+    print("Silver transformation completed.")
 
 if __name__ == "__main__":
-    spark = get_spark_session()
-
-    INPUT_TABLE = "glue_catalog.silver.deidentified_clinical_events"
-    VOCAB_TABLE = "glue_catalog.reference.athena_concept"
-    OUTPUT_TABLE = "glue_catalog.silver.omop_condition_occurrence"
-
-    transform_to_omop_condition(spark, INPUT_TABLE, VOCAB_TABLE, OUTPUT_TABLE)
+    run_silver_transformation()

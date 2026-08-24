@@ -1,40 +1,38 @@
-# src/ingestion/x12_batch_parser.py
-
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, current_timestamp, expr, lit, input_file_name
+from pyspark.sql.functions import col, current_timestamp, lit, expr, explode, split
+import uuid
 
-def get_spark_session():
-    return SparkSession.builder \
-        .appName("X12_EDI_Batch_Ingestion") \
+def process_x12_batch(s3_input_path: str):
+    spark = SparkSession.builder \
+        .appName("EHDIP_X12_Batch_Parser") \
+        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
+        .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
+        .config("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO") \
         .getOrCreate()
 
-def process_x12_batch(spark, s3_input_path, iceberg_table):
-    """
-    Parses X12 EDI files from S3 and ingests them into the Bronze Iceberg table.
-    """
-    # Read raw EDI lines as text
-    df_raw = spark.read.text(s3_input_path)
+    # Read raw X12 as text lines
+    raw_df = spark.read.text(s3_input_path)
 
-    # In a real scenario, this would apply an EDI parsing library or custom UDF.
-    # Here we treat the raw EDI segment string as the payload and wrap it in JSON.
-    df_transformed = df_raw \
-        .withColumn("payload_id", expr("uuid()")) \
-        .withColumn("source_system_id", lit("x12_edi_batch")) \
-        .withColumn("raw_payload_json", col("value")) \
+    # Simplified parsing for demonstration (assume '~' separated segments)
+    segments_df = raw_df.select(explode(split(col("value"), "~")).alias("segment")) \
+        .filter(col("segment") != "")
+
+    # Construct the JSON payload mapping for Bronze
+    processed_df = segments_df.selectExpr("segment as raw_payload_json") \
         .withColumn("ingestion_timestamp", current_timestamp()) \
-        .select("payload_id", "source_system_id", "raw_payload_json", "ingestion_timestamp")
+        .withColumn("source_system_id", lit("x12_batch_ftp")) \
+        .withColumn("payload_id", expr("uuid()"))
 
-    # Append to Bronze Iceberg
-    df_transformed.write \
+    # Write to Bronze Iceberg
+    processed_df.write \
         .format("iceberg") \
         .mode("append") \
-        .saveAsTable(iceberg_table)
+        .saveAsTable("glue_catalog.ehdip_bronze.raw_payloads")
 
 if __name__ == "__main__":
-    spark = get_spark_session()
-
-    # Configuration
-    S3_INPUT_PATH = "s3://ehdip-datalake-landing-123456789012/x12/837/*.edi"
-    ICEBERG_TABLE = "glue_catalog.bronze.raw_x12_payload"
-
-    process_x12_batch(spark, S3_INPUT_PATH, ICEBERG_TABLE)
+    import sys
+    if len(sys.argv) > 1:
+        process_x12_batch(sys.argv[1])
+    else:
+        print("Provide S3 input path")

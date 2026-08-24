@@ -1,73 +1,47 @@
-# src/quality/dq_circuit_breaker.py
+from pydeequ.checks import Check, CheckLevel
+from pydeequ.verification import VerificationSuite
+import pydeequ
 
-import json
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, current_timestamp
+def run_data_quality_checks(spark, df):
+    """Runs data quality checks and routes invalid records to DLQ."""
 
-# Ensure PyDeequ dependencies are included in the spark session
-# e.g. spark-submit --packages com.amazon.deequ:deequ:2.0.3-spark-3.3
+    check = Check(spark, CheckLevel.Error, "OMOP Data Quality Check")
 
-def get_spark_session():
-    return SparkSession.builder \
-        .appName("DQ_Circuit_Breaker") \
-        .getOrCreate()
+    checkResult = VerificationSuite(spark) \
+        .onData(df) \
+        .addCheck(
+            check.isComplete("person_id")  # person_id cannot be null
+            .isComplete("condition_concept_id") # Must have concept
+            .isNonNegative("condition_concept_id")
+            # Logical dates (no future dates for start)
+            # Add more clinical plausibility checks
+        ) \
+        .run()
 
-def run_dq_and_route(spark, input_table, valid_output_table, dlq_output_table):
-    """
-    Validates data. Good records go to valid_output_table.
-    Bad records are routed to a Dead Letter Queue (DLQ) table.
-    """
-    df_input = spark.table(input_table)
+    checkResult_df = VerificationSuite.checkResultsAsDataFrame(spark, checkResult)
 
-    # Optional: If PyDeequ is available, we would use VerificationSuite
-    # from pydeequ.checks import *
-    # from pydeequ.verification import *
+    # Analyze results
+    status = checkResult_df.filter(checkResult_df.check_status == 'Error').count() == 0
 
-    # We will tag rows with errors
-    df_with_errors = df_input \
-        .withColumn("dq_error_null_id", col("person_id").isNull()) \
-        .withColumn("dq_error_future_date", col("birth_date") > current_timestamp().cast("date"))
-
-    if "heart_rate" in df_with_errors.columns:
-        df_with_errors = df_with_errors.withColumn(
-            "dq_error_invalid_vitals",
-            (col("heart_rate") < 0) | (col("heart_rate") > 300)
-        )
+    if not status:
+        # Route to DLQ (Simplified logic: write entire batch to DLQ if error exists,
+        # normally you would filter row-by-row or use a rules engine for row-level DLQ routing)
+        print("Data Quality Checks FAILED. Routing to DLQ.")
+        df.write.format("iceberg").mode("append").saveAsTable("glue_catalog.ehdip_dlq.omop_conditions")
+        return False
     else:
-        df_with_errors = df_with_errors.withColumn("dq_error_invalid_vitals", lit(False))
-
-    # Combine errors to determine if valid
-    df_evaluated = df_with_errors.withColumn(
-        "is_valid",
-        ~(col("dq_error_null_id") | col("dq_error_future_date") | col("dq_error_invalid_vitals"))
-    )
-
-    # Split Data
-    df_valid = df_evaluated.filter(col("is_valid")).drop("dq_error_null_id", "dq_error_future_date", "dq_error_invalid_vitals", "is_valid")
-
-    # For DLQ, create an error manifest column
-    # In practice, this would serialize the specific failed rules to a JSON string
-    df_dlq = df_evaluated.filter(~col("is_valid")) \
-        .withColumn("dlq_timestamp", current_timestamp()) \
-        .withColumn("error_manifest", lit("Validation failed for one or more rules: null_id, future_date, or invalid_vitals"))
-
-    # Write Valid Records
-    df_valid.write \
-        .format("iceberg") \
-        .mode("append") \
-        .saveAsTable(valid_output_table)
-
-    # Write Bad Records to DLQ
-    df_dlq.write \
-        .format("iceberg") \
-        .mode("append") \
-        .saveAsTable(dlq_output_table)
+        print("Data Quality Checks PASSED.")
+        return True
 
 if __name__ == "__main__":
-    spark = get_spark_session()
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder \
+        .appName("EHDIP_DQ_Circuit_Breaker") \
+        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
+        .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
+        .config("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO") \
+        .getOrCreate()
 
-    INPUT_TABLE = "glue_catalog.silver.omop_person_raw"
-    VALID_TABLE = "glue_catalog.silver.omop_person_validated"
-    DLQ_TABLE = "glue_catalog.silver.dq_quarantine_dlq"
-
-    run_dq_and_route(spark, INPUT_TABLE, VALID_TABLE, DLQ_TABLE)
+    df = spark.read.table("glue_catalog.ehdip_silver.condition_occurrence")
+    run_data_quality_checks(spark, df)

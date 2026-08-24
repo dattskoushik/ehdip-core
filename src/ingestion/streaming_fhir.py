@@ -1,61 +1,48 @@
-# src/ingestion/streaming_fhir.py
-
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, current_timestamp, expr
+from pyspark.sql.functions import col, current_timestamp, lit, expr
+from pyspark.sql.types import StringType, StructType, StructField
+import uuid
+import os
 
-def get_spark_session():
-    return SparkSession.builder \
-        .appName("FHIR_Streaming_Ingestion") \
+def process_fhir_stream():
+    spark = SparkSession.builder \
+        .appName("EHDIP_Streaming_FHIR") \
+        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
+        .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
+        .config("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO") \
         .getOrCreate()
 
-def process_stream(spark, kafka_bootstrap_servers, kafka_topic, checkpoint_location, iceberg_table):
-    """
-    Consumes FHIR R4 JSON from AWS MSK (Kafka) and appends to Bronze Iceberg table.
-    """
+    # Kafka MSK Configuration (SASL/SCRAM)
+    kafka_brokers = "b-1.ehdip-msk.xxxxx.c4.kafka.us-east-1.amazonaws.com:9096,b-2.ehdip-msk.xxxxx.c4.kafka.us-east-1.amazonaws.com:9096"
+    kafka_topic = "fhir_raw_topic"
 
-    # Read from Kafka (MSK with SASL/SCRAM authentication simulation)
-    # Note: For real MSK, we would configure sasl.jaas.config, sasl.mechanism, security.protocol
-    df_stream = spark.readStream \
+    # Read from MSK
+    df = spark.readStream \
         .format("kafka") \
-        .option("kafka.bootstrap.servers", kafka_bootstrap_servers) \
+        .option("kafka.bootstrap.servers", kafka_brokers) \
         .option("subscribe", kafka_topic) \
         .option("startingOffsets", "earliest") \
+        .option("kafka.security.protocol", "SASL_SSL") \
+        .option("kafka.sasl.mechanism", "SCRAM-SHA-512") \
+        .option("kafka.sasl.jaas.config", f"org.apache.kafka.common.security.scram.ScramLoginModule required username='ehdip_user' password='{os.environ.get('EHDIP_KAFKA_PASSWORD', 'default')}';") \
         .load()
 
-    # Parse Kafka payload and construct Bronze record
-    # The 'value' column from Kafka is a binary, we cast it to string which is our raw_payload_json
-    transformed_df = df_stream.selectExpr("CAST(value AS STRING) as raw_payload_json") \
-        .withColumn("payload_id", expr("uuid()")) \
-        .withColumn("source_system_id", expr("'msk_fhir_stream'")) \
-        .withColumn("ingestion_timestamp", current_timestamp())
+    # Transform
+    processed_df = df.selectExpr("CAST(value AS STRING) as raw_payload_json") \
+        .withColumn("ingestion_timestamp", current_timestamp()) \
+        .withColumn("source_system_id", lit("kafka_msk_fhir_stream")) \
+        .withColumn("payload_id", expr("uuid()"))
 
-    # Reorder columns to match Iceberg table schema:
-    # payload_id, source_system_id, raw_payload_json, ingestion_timestamp
-    final_df = transformed_df.select(
-        "payload_id",
-        "source_system_id",
-        "raw_payload_json",
-        "ingestion_timestamp"
-    )
-
-    # Write stream to Iceberg Bronze table
-    query = final_df.writeStream \
+    # Write to Bronze Iceberg
+    query = processed_df.writeStream \
         .format("iceberg") \
         .outputMode("append") \
         .trigger(processingTime="1 minute") \
-        .option("checkpointLocation", checkpoint_location) \
-        .toTable(iceberg_table)
+        .option("checkpointLocation", "s3://ehdip-datalake-bronze-checkpoint/streaming_fhir/") \
+        .toTable("glue_catalog.ehdip_bronze.raw_payloads")
 
-    return query
+    query.awaitTermination()
 
 if __name__ == "__main__":
-    spark = get_spark_session()
-
-    # Configuration
-    KAFKA_BOOTSTRAP_SERVERS = "b-1.ehdipmsk.xyz.c2.kafka.us-east-1.amazonaws.com:9096,b-2.ehdipmsk.xyz.c2.kafka.us-east-1.amazonaws.com:9096"
-    KAFKA_TOPIC = "fhir_raw_stream"
-    CHECKPOINT_LOCATION = "s3://ehdip-datalake-bronze-123456789012/checkpoints/fhir_stream"
-    ICEBERG_TABLE = "glue_catalog.bronze.raw_fhir_payload"
-
-    query = process_stream(spark, KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, CHECKPOINT_LOCATION, ICEBERG_TABLE)
-    query.awaitTermination()
+    process_fhir_stream()

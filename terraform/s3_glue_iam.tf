@@ -1,107 +1,61 @@
-# terraform/s3_glue_iam.tf
-
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
-}
-
 provider "aws" {
   region = "us-east-1"
 }
 
-# KMS Key for S3 Encryption (HIPAA Requirement)
-resource "aws_kms_key" "datalake_kms" {
-  description             = "KMS key for encrypting Datalake S3 buckets"
+data "aws_caller_identity" "current" {}
+
+resource "aws_kms_key" "s3_kms_key" {
+  description             = "KMS key for EHDIP S3 bucket encryption (HIPAA compliant)"
   enable_key_rotation     = true
   deletion_window_in_days = 30
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "Enable IAM User Permissions"
-        Effect = "Allow"
-        Principal = {
-          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
-        }
-        Action   = "kms:*"
-        Resource = "*"
-      }
-    ]
-  })
 }
 
-resource "aws_kms_alias" "datalake_kms_alias" {
-  name          = "alias/datalake-key"
-  target_key_id = aws_kms_key.datalake_kms.key_id
-}
-
-# S3 Buckets for Medallion Architecture
 locals {
-  buckets = ["bronze", "silver", "gold"]
+  zones = ["bronze", "silver", "gold"]
 }
 
-resource "aws_s3_bucket" "datalake_buckets" {
-  for_each = toset(local.buckets)
+resource "aws_s3_bucket" "datalake" {
+  for_each = toset(local.zones)
   bucket   = "ehdip-datalake-${each.key}-${data.aws_caller_identity.current.account_id}"
+}
 
-  tags = {
-    Environment = "Production"
-    Zone        = each.key
-    Compliance  = "HIPAA"
+resource "aws_s3_bucket_versioning" "datalake_versioning" {
+  for_each = toset(local.zones)
+  bucket   = aws_s3_bucket.datalake[each.key].id
+  versioning_configuration {
+    status = "Enabled"
   }
 }
 
-# Block Public Access (HIPAA Requirement)
-resource "aws_s3_bucket_public_access_block" "datalake_public_access_block" {
-  for_each = aws_s3_bucket.datalake_buckets
+resource "aws_s3_bucket_server_side_encryption_configuration" "datalake_encryption" {
+  for_each = toset(local.zones)
+  bucket   = aws_s3_bucket.datalake[each.key].id
 
-  bucket                  = each.value.id
+  rule {
+    apply_server_side_encryption_by_default {
+      kms_master_key_id = aws_kms_key.s3_kms_key.arn
+      sse_algorithm     = "aws:kms"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "datalake_public_access" {
+  for_each = toset(local.zones)
+  bucket   = aws_s3_bucket.datalake[each.key].id
+
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
 }
 
-# Enable SSE-KMS Encryption
-resource "aws_s3_bucket_server_side_encryption_configuration" "datalake_encryption" {
-  for_each = aws_s3_bucket.datalake_buckets
-
-  bucket = each.value.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      kms_master_key_id = aws_kms_key.datalake_kms.arn
-      sse_algorithm     = "aws:kms"
-    }
-  }
+resource "aws_glue_catalog_database" "ehdip_database" {
+  for_each = toset(local.zones)
+  name     = "ehdip_${each.key}"
 }
 
-# Enable Versioning
-resource "aws_s3_bucket_versioning" "datalake_versioning" {
-  for_each = aws_s3_bucket.datalake_buckets
-
-  bucket = each.value.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-# Data AWS Caller Identity
-data "aws_caller_identity" "current" {}
-
-# Glue Catalog Database
-resource "aws_glue_catalog_database" "iceberg_catalog" {
-  name        = "ehdip_iceberg_catalog"
-  description = "Glue Catalog for Iceberg Tables"
-}
-
-# Least Privilege IAM Role for Data Engineering Processing
-resource "aws_iam_role" "de_processing_role" {
-  name = "EHDIP_DE_Processing_Role"
+resource "aws_iam_role" "glue_service_role" {
+  name = "ehdip-glue-service-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -110,16 +64,19 @@ resource "aws_iam_role" "de_processing_role" {
         Action = "sts:AssumeRole"
         Effect = "Allow"
         Principal = {
-          Service = ["glue.amazonaws.com", "emr-serverless.amazonaws.com"]
+          Service = [
+            "glue.amazonaws.com",
+            "emr-serverless.amazonaws.com"
+          ]
         }
       }
     ]
   })
 }
 
-resource "aws_iam_policy" "de_processing_policy" {
-  name        = "EHDIP_DE_Processing_Policy"
-  description = "Least privilege access for DE processing"
+resource "aws_iam_policy" "least_privilege_policy" {
+  name        = "ehdip-least-privilege-policy"
+  description = "Least privilege IAM policy for EHDIP components"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -129,24 +86,31 @@ resource "aws_iam_policy" "de_processing_policy" {
         Action = [
           "s3:GetObject",
           "s3:PutObject",
-          "s3:DeleteObject",
-          "s3:ListBucket"
+          "s3:DeleteObject"
         ]
-        Resource = flatten([
-          for bucket in aws_s3_bucket.datalake_buckets : [
-            bucket.arn,
-            "${bucket.arn}/*"
-          ]
-        ])
+        Resource = [
+          for zone in local.zones : "${aws_s3_bucket.datalake[zone].arn}/*"
+        ]
       },
       {
         Effect = "Allow"
         Action = [
-          "kms:Decrypt",
-          "kms:Encrypt",
-          "kms:GenerateDataKey"
+          "s3:ListBucket"
         ]
-        Resource = aws_kms_key.datalake_kms.arn
+        Resource = [
+          for zone in local.zones : aws_s3_bucket.datalake[zone].arn
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ]
+        Resource = aws_kms_key.s3_kms_key.arn
       },
       {
         Effect = "Allow"
@@ -155,19 +119,27 @@ resource "aws_iam_policy" "de_processing_policy" {
           "glue:GetTable",
           "glue:CreateTable",
           "glue:UpdateTable",
-          "glue:DeleteTable"
+          "glue:DeleteTable",
+          "glue:GetPartitions",
+          "glue:GetPartition",
+          "glue:BatchCreatePartition",
+          "glue:BatchDeletePartition"
         ]
         Resource = [
           "arn:aws:glue:us-east-1:${data.aws_caller_identity.current.account_id}:catalog",
-          "arn:aws:glue:us-east-1:${data.aws_caller_identity.current.account_id}:database/ehdip_iceberg_catalog",
-          "arn:aws:glue:us-east-1:${data.aws_caller_identity.current.account_id}:table/ehdip_iceberg_catalog/*"
+          "arn:aws:glue:us-east-1:${data.aws_caller_identity.current.account_id}:database/ehdip_bronze",
+          "arn:aws:glue:us-east-1:${data.aws_caller_identity.current.account_id}:table/ehdip_bronze/*",
+          "arn:aws:glue:us-east-1:${data.aws_caller_identity.current.account_id}:database/ehdip_silver",
+          "arn:aws:glue:us-east-1:${data.aws_caller_identity.current.account_id}:table/ehdip_silver/*",
+          "arn:aws:glue:us-east-1:${data.aws_caller_identity.current.account_id}:database/ehdip_gold",
+          "arn:aws:glue:us-east-1:${data.aws_caller_identity.current.account_id}:table/ehdip_gold/*"
         ]
       }
     ]
   })
 }
 
-resource "aws_iam_role_policy_attachment" "de_processing_attach" {
-  role       = aws_iam_role.de_processing_role.name
-  policy_arn = aws_iam_policy.de_processing_policy.arn
+resource "aws_iam_role_policy_attachment" "glue_attach" {
+  role       = aws_iam_role.glue_service_role.name
+  policy_arn = aws_iam_policy.least_privilege_policy.arn
 }

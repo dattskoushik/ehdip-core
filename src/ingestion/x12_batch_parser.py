@@ -1,47 +1,45 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, current_timestamp, lit, expr
 import sys
+import uuid
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, current_timestamp, lit, udf
+from pyspark.sql.types import StringType
 
-def get_spark_session(app_name="X12_EDI_Batch_Parser"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
-        .getOrCreate()
+def generate_uuid():
+    return str(uuid.uuid4())
 
-def process_x12_batch(spark, input_path, output_table):
-    # Read raw text lines
+uuid_udf = udf(generate_uuid, StringType())
+
+def parse_x12_to_bronze(spark: SparkSession, input_path: str, bronze_table: str):
+    """
+    Parses X12 EDI 837/835 flat files and stores them into the Bronze Iceberg table.
+    For simplicity, treating each line as a raw payload.
+    """
     df_raw = spark.read.text(input_path)
 
-    # Simplified parsing for X12 (splitting by ~)
-    # In a real scenario, a dedicated X12 parser library would be used
-    df_parsed = df_raw \
-        .withColumn("payload_id", expr("uuid()")) \
+    df_bronze = df_raw.selectExpr("value as raw_payload_json") \
+        .withColumn("payload_id", uuid_udf()) \
         .withColumn("source_system_id", lit("EDI_X12_BATCH")) \
-        .withColumn("raw_payload_json", col("value")) \
-        .withColumn("ingestion_timestamp", current_timestamp())
+        .withColumn("ingestion_timestamp", current_timestamp()) \
+        .select("payload_id", "source_system_id", "ingestion_timestamp", "raw_payload_json")
 
-    df_final = df_parsed.select("payload_id", "source_system_id", "raw_payload_json", "ingestion_timestamp")
-
-    # Append to Bronze Iceberg table
-    df_final.write \
+    # Write to Bronze Iceberg table
+    df_bronze.write \
         .format("iceberg") \
         .mode("append") \
-        .saveAsTable(output_table)
+        .saveAsTable(bronze_table)
 
-    print(f"Successfully processed X12 batch from {input_path} into {output_table}")
+    print(f"Successfully processed X12 batch from {input_path} into {bronze_table}")
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: x12_batch_parser.py <input_s3_path> <output_iceberg_table>")
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: x12_batch_parser.py <input_path> <bronze_table>")
         sys.exit(1)
 
     input_path = sys.argv[1]
-    output_table = sys.argv[2]
+    bronze_table = sys.argv[2]
 
-    spark = get_spark_session()
-    process_x12_batch(spark, input_path, output_table)
+    spark = SparkSession.builder \
+        .appName("EHDIP_X12_Batch_Ingestion") \
+        .getOrCreate()
 
-if __name__ == "__main__":
-    main()
+    parse_x12_to_bronze(spark, input_path, bronze_table)

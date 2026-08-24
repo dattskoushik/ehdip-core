@@ -1,45 +1,39 @@
--- snowflake/02_security_masking_rbac.sql
+-- Day 9: Snowflake Security, Dynamic Masking & dbt Gold Marts
 
-USE ROLE ACCOUNTADMIN;
-
--- 1. Create Roles
-CREATE ROLE IF NOT EXISTS ehdip_data_engineer;
+-- 1. Create Roles (RBAC)
 CREATE ROLE IF NOT EXISTS ehdip_data_scientist;
-CREATE ROLE IF NOT EXISTS ehdip_clinical_analyst;
+CREATE ROLE IF NOT EXISTS ehdip_data_analyst;
+CREATE ROLE IF NOT EXISTS ehdip_compliance_officer;
 
--- Grant usage on database and schemas
-GRANT USAGE ON DATABASE ehdip_db TO ROLE ehdip_data_engineer;
-GRANT USAGE ON SCHEMA ehdip_db.silver TO ROLE ehdip_data_engineer;
-GRANT USAGE ON SCHEMA ehdip_db.gold TO ROLE ehdip_data_engineer;
-
-GRANT USAGE ON DATABASE ehdip_db TO ROLE ehdip_data_scientist;
-GRANT USAGE ON SCHEMA ehdip_db.silver TO ROLE ehdip_data_scientist;
-
-GRANT USAGE ON DATABASE ehdip_db TO ROLE ehdip_clinical_analyst;
-GRANT USAGE ON SCHEMA ehdip_db.gold TO ROLE ehdip_clinical_analyst;
-
--- 2. Create Masking Policies
-CREATE OR REPLACE MASKING POLICY ehdip_db.silver.ssn_mask AS (val string) RETURNS string ->
+-- 2. Create Dynamic Data Masking Policies for PHI
+CREATE OR REPLACE MASKING POLICY ssn_mask AS (val string) RETURNS string ->
   CASE
-    WHEN CURRENT_ROLE() IN ('ehdip_data_engineer') THEN val
+    WHEN CURRENT_ROLE() IN ('EHDIP_COMPLIANCE_OFFICER') THEN val
     ELSE '***-**-****'
   END;
 
-CREATE OR REPLACE MASKING POLICY ehdip_db.silver.dob_mask AS (val date) RETURNS date ->
+CREATE OR REPLACE MASKING POLICY mrn_mask AS (val string) RETURNS string ->
   CASE
-    WHEN CURRENT_ROLE() IN ('ehdip_data_engineer', 'ehdip_clinical_analyst') THEN val
-    ELSE DATE_TRUNC('YEAR', val) -- Mask to just the year for Data Scientists
+    WHEN CURRENT_ROLE() IN ('EHDIP_COMPLIANCE_OFFICER', 'EHDIP_DATA_SCIENTIST') THEN val
+    ELSE 'REDACTED_MRN'
   END;
 
--- 3. Apply Masking Policies to Tables
--- Assuming omop_person has these columns in a non-strict OMOP extension or source table
--- ALTER TABLE ehdip_db.silver.omop_person MODIFY COLUMN ssn SET MASKING POLICY ehdip_db.silver.ssn_mask;
-ALTER TABLE ehdip_db.silver.omop_person MODIFY COLUMN birth_datetime SET MASKING POLICY ehdip_db.silver.dob_mask;
+CREATE OR REPLACE MASKING POLICY dob_mask AS (val date) RETURNS date ->
+  CASE
+    WHEN CURRENT_ROLE() IN ('EHDIP_COMPLIANCE_OFFICER') THEN val
+    ELSE DATE_TRUNC('YEAR', val) -- Mask to only show the year
+  END;
 
--- 4. Grant Select Privileges
-GRANT SELECT ON ALL TABLES IN SCHEMA ehdip_db.silver TO ROLE ehdip_data_engineer;
-GRANT SELECT ON ALL TABLES IN SCHEMA ehdip_db.gold TO ROLE ehdip_data_engineer;
+-- 3. Apply Masking Policies to Tables (Assuming view or table exists)
+-- E.g., ALTER TABLE gold_patient_profiles MODIFY COLUMN ssn SET MASKING POLICY ssn_mask;
+-- ALTER TABLE gold_patient_profiles MODIFY COLUMN mrn SET MASKING POLICY mrn_mask;
+-- ALTER TABLE gold_patient_profiles MODIFY COLUMN dob SET MASKING POLICY dob_mask;
 
-GRANT SELECT ON ALL TABLES IN SCHEMA ehdip_db.silver TO ROLE ehdip_data_scientist;
+-- 4. Grant Permissions
+GRANT USAGE ON DATABASE ehdip TO ROLE ehdip_data_scientist;
+GRANT USAGE ON SCHEMA ehdip.gold TO ROLE ehdip_data_scientist;
+GRANT SELECT ON ALL TABLES IN SCHEMA ehdip.gold TO ROLE ehdip_data_scientist;
 
-GRANT SELECT ON ALL TABLES IN SCHEMA ehdip_db.gold TO ROLE ehdip_clinical_analyst;
+GRANT USAGE ON DATABASE ehdip TO ROLE ehdip_data_analyst;
+GRANT USAGE ON SCHEMA ehdip.gold TO ROLE ehdip_data_analyst;
+GRANT SELECT ON ALL TABLES IN SCHEMA ehdip.gold TO ROLE ehdip_data_analyst;

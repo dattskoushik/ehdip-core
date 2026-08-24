@@ -1,47 +1,44 @@
-# src/transformation/incremental_merge.py
-
 from pyspark.sql import SparkSession
+import sys
 
-def get_spark_session():
+def get_spark_session(app_name="Incremental_CDC_Merge"):
     return SparkSession.builder \
-        .appName("Incremental_CDC_Merge") \
+        .appName(app_name) \
+        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
+        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
+        .config("spark.sql.catalog.glue_catalog.type", "glue") \
         .getOrCreate()
 
-def merge_cdc_to_silver(spark, source_view, target_table):
+def merge_cdc(spark, cdc_view, target_table):
     """
-    Performs an incremental MERGE INTO on Iceberg Silver tables,
-    handling out-of-order CDC updates via `updated_at`.
+    Performs an incremental MERGE INTO target_table using cdc_view data.
+    Assumes cdc_view has _cdc_op ('c', 'u', 'd') and updated_at to resolve out-of-order events.
     """
-
-    # In Spark 3.x with Iceberg, we can use SQL for the MERGE operation.
-    # The source_view should be a temporary view of the deduplicated incoming CDC batch.
-
     merge_sql = f"""
     MERGE INTO {target_table} t
-    USING {source_view} s
-    ON t.person_id = s.person_id
-    WHEN MATCHED AND s.op = 'd' AND s.updated_at > t.updated_at THEN
+    USING {cdc_view} s
+    ON t.payload_id = s.payload_id
+    WHEN MATCHED AND s._cdc_op = 'd' AND s.updated_at >= t.updated_at THEN
         DELETE
-    WHEN MATCHED AND s.op IN ('u', 'c') AND s.updated_at > t.updated_at THEN
+    WHEN MATCHED AND s._cdc_op IN ('c', 'u') AND s.updated_at >= t.updated_at THEN
         UPDATE SET *
-    WHEN NOT MATCHED AND s.op IN ('c', 'u') THEN
+    WHEN NOT MATCHED AND s._cdc_op IN ('c', 'u') THEN
         INSERT *
     """
 
-    print(f"Executing MERGE:\n{merge_sql}")
     spark.sql(merge_sql)
+    print(f"Merge operation completed on {target_table}")
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: incremental_merge.py <cdc_temp_view> <target_iceberg_table>")
+        sys.exit(1)
+
+    cdc_view = sys.argv[1]
+    target_table = sys.argv[2]
+
+    spark = get_spark_session()
+    merge_cdc(spark, cdc_view, target_table)
 
 if __name__ == "__main__":
-    spark = get_spark_session()
-
-    # Example usage:
-    # 1. Read new CDC events
-    # df_cdc = spark.read.table("glue_catalog.bronze.raw_cdc_payload").filter(...)
-    # 2. Parse JSON, extract fields (person_id, op, updated_at, etc.)
-    # 3. Deduplicate incoming batch to get the latest state per person_id
-    # 4. Create temp view
-    # df_deduped.createOrReplaceTempView("new_cdc_events")
-
-    TARGET_TABLE = "glue_catalog.silver.omop_person"
-
-    # merge_cdc_to_silver(spark, "new_cdc_events", TARGET_TABLE)
+    main()

@@ -1,105 +1,74 @@
-# dags/ehdip_orchestration_dag.py
-
 from airflow import DAG
-from airflow.providers.amazon.aws.operators.emr import EmrServerlessStartJobRunOperator
-from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
-from airflow.utils.dates import days_ago
-from datetime import timedelta
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from airflow.providers.dbt.cloud.operators.dbt import DbtCloudRunJobOperator
+from datetime import datetime, timedelta
 
-from airflow.operators.bash import BashOperator
-# In a real Airflow environment with OpenLineage, you'd set up the provider.
-# from airflow.providers.openlineage.extractors import ...
-
-
-# Default arguments for DAG
+# EHDIP Orchestration DAG for Batch Processing
 default_args = {
-    'owner': 'ehdip_data_eng',
+    'owner': 'ehdip_engineering',
     'depends_on_past': False,
+    'start_date': datetime(2023, 1, 1),
     'email_on_failure': True,
     'email_on_retry': False,
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
 }
 
-# Define DAG
 with DAG(
     'ehdip_end_to_end_pipeline',
     default_args=default_args,
-    description='EHDIP Medallion Architecture Orchestration',
-    schedule_interval=timedelta(hours=1),
-    start_date=days_ago(1),
+    description='EHDIP Data Pipeline: Bronze -> Silver -> DQ -> Gold',
+    schedule_interval=timedelta(days=1),
     catchup=False,
-    tags=['ehdip', 'production', 'iceberg', 'snowflake'],
+    tags=['ehdip', 'production'],
+    # OpenLineage integration is typically configured at the Airflow cluster level
+    # (e.g. MWAA environment variables for AIRFLOW__LINEAGE__BACKEND)
 ) as dag:
 
-    # 1. Batch Ingestion (X12 EDI) -> Bronze
-    ingest_x12_bronze = EmrServerlessStartJobRunOperator(
-        task_id='ingest_x12_to_bronze',
-        application_id='app-12345xxxxxx',
-        execution_role_arn='arn:aws:iam::123456789012:role/EMR_Serverless_Execution_Role',
-        job_driver={
-            'sparkSubmit': {
-                'entryPoint': 's3://ehdip-scripts/ingestion/x12_batch_parser.py',
-            }
-        },
+    # 1. Ingestion to Bronze (Batch X12 as an example)
+    ingest_bronze = SparkSubmitOperator(
+        task_id='ingest_to_bronze',
+        application='src/ingestion/x12_batch_parser.py',
+        application_args=['s3://ehdip-landing/x12/latest/', 'glue_catalog.ehdip_data_lake.bronze_raw_payloads'],
+        conf={'spark.openlineage.namespace': 'ehdip-prod'}
     )
 
-    # 2. CDC Ingestion -> Bronze
-    ingest_cdc_bronze = EmrServerlessStartJobRunOperator(
-        task_id='ingest_cdc_to_bronze',
-        application_id='app-12345xxxxxx',
-        execution_role_arn='arn:aws:iam::123456789012:role/EMR_Serverless_Execution_Role',
-        job_driver={
-            'sparkSubmit': {
-                'entryPoint': 's3://ehdip-scripts/ingestion/cdc_consumer.py',
-            }
-        },
+    # 2. De-identification
+    deidentify_phi = SparkSubmitOperator(
+        task_id='deidentify_phi',
+        application='src/security/deid_engine.py',
+        application_args=['glue_catalog.ehdip_data_lake.bronze_raw_payloads', 'glue_catalog.ehdip_data_lake.bronze_deid_payloads'],
+        conf={'spark.openlineage.namespace': 'ehdip-prod'}
     )
 
-    # 3. De-Identification Engine (Bronze -> Silver)
-    run_deid_engine = EmrServerlessStartJobRunOperator(
-        task_id='run_phi_deidentification',
-        application_id='app-12345xxxxxx',
-        execution_role_arn='arn:aws:iam::123456789012:role/EMR_Serverless_Execution_Role',
-        job_driver={
-            'sparkSubmit': {
-                'entryPoint': 's3://ehdip-scripts/security/deid_engine.py',
-            }
-        },
+    # 3. OMOP Transformation (Silver)
+    transform_silver = SparkSubmitOperator(
+        task_id='transform_silver_omop',
+        application='src/transformation/omop_silver_transformer.py',
+        application_args=['glue_catalog.ehdip_data_lake.bronze_deid_payloads', 'glue_catalog.ehdip_data_lake'],
+        conf={'spark.openlineage.namespace': 'ehdip-prod'}
     )
 
     # 4. Data Quality & DLQ Routing
-    run_dq_checks = EmrServerlessStartJobRunOperator(
-        task_id='run_dq_circuit_breaker',
-        application_id='app-12345xxxxxx',
-        execution_role_arn='arn:aws:iam::123456789012:role/EMR_Serverless_Execution_Role',
-        job_driver={
-            'sparkSubmit': {
-                'entryPoint': 's3://ehdip-scripts/quality/dq_circuit_breaker.py',
-            }
-        },
+    data_quality_check = SparkSubmitOperator(
+        task_id='data_quality_validation',
+        application='src/quality/dq_circuit_breaker.py',
+        application_args=[
+            'glue_catalog.ehdip_data_lake.condition_occurrence',
+            'glue_catalog.ehdip_data_lake.condition_occurrence_valid',
+            'glue_catalog.ehdip_data_lake.condition_occurrence_dlq'
+        ],
+        conf={'spark.openlineage.namespace': 'ehdip-prod'}
     )
 
-    # 5. Silver OMOP Transformation
-    transform_omop_silver = EmrServerlessStartJobRunOperator(
-        task_id='transform_to_omop_silver',
-        application_id='app-12345xxxxxx',
-        execution_role_arn='arn:aws:iam::123456789012:role/EMR_Serverless_Execution_Role',
-        job_driver={
-            'sparkSubmit': {
-                'entryPoint': 's3://ehdip-scripts/transformation/omop_silver_transformer.py',
-            }
-        },
+    # 5. Run dbt Gold Models (Using dbt Cloud as an example in a modern stack)
+    # Alternatively, could be a BashOperator running dbt-core
+    run_dbt_gold = DbtCloudRunJobOperator(
+        task_id="run_dbt_gold_marts",
+        job_id=12345, # Simulated Job ID
+        check_interval=30,
+        timeout=300
     )
-
-
-    # 6. Trigger dbt models for Gold Marts
-    run_dbt_gold_marts = BashOperator(
-        task_id='run_dbt_gold_marts',
-        bash_command='dbt run --models gold.* --profiles-dir /usr/local/airflow/dbt',
-        env={'OPENLINEAGE_URL': 'http://openlineage:5000', 'OPENLINEAGE_NAMESPACE': 'ehdip_prod'},
-    )
-
 
     # Define Dependencies
-    [ingest_x12_bronze, ingest_cdc_bronze] >> run_deid_engine >> run_dq_checks >> transform_omop_silver >> run_dbt_gold_marts
+    ingest_bronze >> deidentify_phi >> transform_silver >> data_quality_check >> run_dbt_gold

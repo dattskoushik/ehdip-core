@@ -1,68 +1,62 @@
 import sys
+import uuid
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, current_timestamp, expr
-from pyspark.sql.types import StructType, StructField, StringType, MapType
+from pyspark.sql.functions import col, from_json, current_timestamp, lit, udf
+from pyspark.sql.types import StringType
 
-def get_spark_session(app_name="StreamingFHIR_Ingestion"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
-        .getOrCreate()
+def generate_uuid():
+    return str(uuid.uuid4())
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: streaming_fhir.py <kafka_bootstrap_servers> <kafka_topic>")
-        sys.exit(1)
+uuid_udf = udf(generate_uuid, StringType())
 
-    kafka_bootstrap_servers = sys.argv[1]
-    kafka_topic = sys.argv[2]
-
-    spark = get_spark_session()
-
-    # Define schema for incoming FHIR JSON (simplified for dynamic payload)
-    # Using MapType to handle schema evolution naturally or string to hold raw JSON
-    schema = StructType([
-        StructField("id", StringType(), True),
-        StructField("resourceType", StringType(), True)
-    ])
-
-    # Read from Kafka/MSK
-    df_stream = spark.readStream \
+def process_fhir_stream(spark: SparkSession, msk_brokers: str, topic: str, bronze_table: str):
+    """
+    Consumes FHIR R4 JSON from MSK (SASL/SCRAM) and appends to Bronze Iceberg.
+    """
+    # Read stream from Kafka (AWS MSK)
+    # In a real environment, the SECURE_PASSWORD would be dynamically fetched from AWS Secrets Manager
+    # before the Spark job launches, passing it in securely via environment variables or Spark configurations.
+    df_raw = spark.readStream \
         .format("kafka") \
-        .option("kafka.bootstrap.servers", kafka_bootstrap_servers) \
-        .option("subscribe", kafka_topic) \
+        .option("kafka.bootstrap.servers", msk_brokers) \
+        .option("subscribe", topic) \
         .option("kafka.security.protocol", "SASL_SSL") \
         .option("kafka.sasl.mechanism", "SCRAM-SHA-512") \
+        .option("kafka.sasl.jaas.config", "org.apache.kafka.common.security.scram.ScramLoginModule required username='ehdip_streaming_user' password='[SECURE_PASSWORD]';") \
         .option("startingOffsets", "earliest") \
+        .option("failOnDataLoss", "false") \
         .load()
 
-    # Parse JSON payload and construct audit fields
-    # Keep the raw payload JSON to support schema evolution
-    parsed_df = df_stream \
-        .selectExpr("CAST(value AS STRING) as raw_payload_json") \
+    # Parse and transform payload to Bronze schema
+    # Kafka value contains the raw JSON payload
+    df_bronze = df_raw.selectExpr("CAST(value AS STRING) as raw_payload_json") \
+        .withColumn("payload_id", uuid_udf()) \
+        .withColumn("source_system_id", lit("MSK_FHIR_STREAM")) \
         .withColumn("ingestion_timestamp", current_timestamp()) \
-        .withColumn("source_system_id", expr("'AWS_MSK_FHIR_TOPIC'")) \
-        .withColumn("payload_id", expr("uuid()"))
+        .select("payload_id", "source_system_id", "ingestion_timestamp", "raw_payload_json")
 
-    # Select columns matching the Bronze schema
-    final_df = parsed_df.select(
-        "payload_id",
-        "source_system_id",
-        "raw_payload_json",
-        "ingestion_timestamp"
-    )
-
-    # Write stream to Iceberg Bronze table
-    query = final_df.writeStream \
+    # Write stream to Bronze Iceberg table
+    query = df_bronze.writeStream \
         .format("iceberg") \
         .outputMode("append") \
         .trigger(processingTime="1 minute") \
-        .option("checkpointLocation", "s3://ehdip-bronze-raw/checkpoints/fhir_ingestion/") \
-        .toTable("glue_catalog.ehdip_data_lake.bronze_raw_payloads")
+        .option("checkpointLocation", f"s3://ehdip-bronze-data-lake/checkpoints/fhir_stream/") \
+        .toTable(bronze_table)
 
-    query.awaitTermination()
+    return query
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 4:
+        print("Usage: streaming_fhir.py <msk_brokers> <topic> <bronze_table>")
+        sys.exit(1)
+
+    msk_brokers = sys.argv[1]
+    topic = sys.argv[2]
+    bronze_table = sys.argv[3]
+
+    spark = SparkSession.builder \
+        .appName("EHDIP_Streaming_FHIR_Ingestion") \
+        .getOrCreate()
+
+    query = process_fhir_stream(spark, msk_brokers, topic, bronze_table)
+    query.awaitTermination()

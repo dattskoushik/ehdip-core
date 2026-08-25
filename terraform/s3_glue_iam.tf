@@ -1,3 +1,7 @@
+data "aws_caller_identity" "current" {}
+
+data "aws_region" "current" {}
+
 provider "aws" {
   region = "us-east-1"
 }
@@ -92,13 +96,17 @@ resource "aws_iam_policy" "ehdip_s3_least_privilege" {
     Statement = [
       {
         Action = [
+          "s3:ListBucket",
           "s3:GetObject",
           "s3:PutObject"
         ]
         Effect = "Allow"
         Resource = [
+          "${aws_s3_bucket.bronze.arn}",
           "${aws_s3_bucket.bronze.arn}/*",
+          "${aws_s3_bucket.silver.arn}",
           "${aws_s3_bucket.silver.arn}/*",
+          "${aws_s3_bucket.gold.arn}",
           "${aws_s3_bucket.gold.arn}/*"
         ]
       },
@@ -109,7 +117,24 @@ resource "aws_iam_policy" "ehdip_s3_least_privilege" {
         ]
         Effect   = "Allow"
         Resource = aws_kms_key.s3_kms_key.arn
-      }
+      },
+      {
+        Action = [
+          "glue:GetDatabase",
+          "glue:GetTable",
+          "glue:GetDatabases",
+          "glue:GetTables",
+          "glue:CreateTable",
+          "glue:UpdateTable",
+          "glue:DeleteTable"
+        ]
+        Effect   = "Allow"
+        Resource = [
+          "arn:aws:glue:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:catalog",
+          "arn:aws:glue:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:database/ehdip_data_lake",
+          "arn:aws:glue:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/ehdip_data_lake/*"
+        ]
+      },
     ]
   })
 }
@@ -124,7 +149,10 @@ resource "aws_iam_role" "ehdip_data_platform_role" {
         Action = "sts:AssumeRole"
         Effect = "Allow"
         Principal = {
-          Service = "ec2.amazonaws.com"
+          Service = [
+          "ec2.amazonaws.com",
+          "emr-serverless.amazonaws.com"
+        ]
         }
       }
     ]

@@ -14,8 +14,11 @@ def get_spark_session(app_name="PHI_DeID_Engine"):
 def simulate_fpe(value):
     if not value: return value
     import hashlib
-    # Simple hash for demo
-    return hashlib.sha256(value.encode('utf-8')).hexdigest()[:len(value)]
+    import os
+    # Fetch salt from environment variable for FPE
+    salt = os.environ.get('EHDIP_HASH_SALT', '')
+    # Salted hash for demo
+    return hashlib.sha256((value + salt).encode('utf-8')).hexdigest()[:len(value)]
 
 fpe_udf = udf(simulate_fpe, StringType())
 

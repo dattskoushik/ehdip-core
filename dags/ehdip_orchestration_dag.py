@@ -61,6 +61,17 @@ with DAG(
         conf={'spark.openlineage.namespace': 'ehdip-prod'}
     )
 
+    # 4.5 Silver Incremental Merge
+    silver_incremental_merge = SparkSubmitOperator(
+        task_id='silver_incremental_merge',
+        application='src/transformation/incremental_merge.py',
+        application_args=[
+            'glue_catalog.ehdip_data_lake.condition_occurrence_valid',
+            'glue_catalog.ehdip_data_lake.condition_occurrence'
+        ],
+        conf={'spark.openlineage.namespace': 'ehdip-prod'}
+    )
+
     # 5. Run dbt Gold Models (Using dbt Cloud as an example in a modern stack)
     # Alternatively, could be a BashOperator running dbt-core
     run_dbt_gold = DbtCloudRunJobOperator(
@@ -71,4 +82,4 @@ with DAG(
     )
 
     # Define Dependencies
-    ingest_bronze >> deidentify_phi >> transform_silver >> data_quality_check >> run_dbt_gold
+    ingest_bronze >> deidentify_phi >> transform_silver >> data_quality_check >> silver_incremental_merge >> run_dbt_gold

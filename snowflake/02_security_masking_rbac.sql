@@ -1,39 +1,41 @@
--- Day 9: Snowflake Security, Dynamic Masking & dbt Gold Marts
+-- 1. Create Data Analyst and Clinician Roles
+CREATE ROLE IF NOT EXISTS DATA_ANALYST;
+CREATE ROLE IF NOT EXISTS CLINICIAN;
 
--- 1. Create Roles (RBAC)
-CREATE ROLE IF NOT EXISTS ehdip_data_scientist;
-CREATE ROLE IF NOT EXISTS ehdip_data_analyst;
-CREATE ROLE IF NOT EXISTS ehdip_compliance_officer;
+-- 2. Grant basic access to PROD Database
+GRANT USAGE ON DATABASE EHDIP_PROD TO ROLE DATA_ANALYST;
+GRANT USAGE ON SCHEMA EHDIP_PROD.SILVER TO ROLE DATA_ANALYST;
+GRANT USAGE ON SCHEMA EHDIP_PROD.GOLD TO ROLE DATA_ANALYST;
+GRANT SELECT ON ALL TABLES IN SCHEMA EHDIP_PROD.GOLD TO ROLE DATA_ANALYST;
 
--- 2. Create Dynamic Data Masking Policies for PHI
+GRANT USAGE ON DATABASE EHDIP_PROD TO ROLE CLINICIAN;
+GRANT USAGE ON SCHEMA EHDIP_PROD.SILVER TO ROLE CLINICIAN;
+GRANT SELECT ON ALL TABLES IN SCHEMA EHDIP_PROD.SILVER TO ROLE CLINICIAN;
+
+-- 3. Dynamic Data Masking Policies
 CREATE OR REPLACE MASKING POLICY ssn_mask AS (val string) RETURNS string ->
   CASE
-    WHEN CURRENT_ROLE() IN ('EHDIP_COMPLIANCE_OFFICER') THEN val
+    WHEN CURRENT_ROLE() IN ('CLINICIAN') THEN val
     ELSE '***-**-****'
   END;
 
 CREATE OR REPLACE MASKING POLICY mrn_mask AS (val string) RETURNS string ->
   CASE
-    WHEN CURRENT_ROLE() IN ('EHDIP_COMPLIANCE_OFFICER', 'EHDIP_DATA_SCIENTIST') THEN val
-    ELSE 'REDACTED_MRN'
+    WHEN CURRENT_ROLE() IN ('CLINICIAN') THEN val
+    ELSE '***-REDACTED-***'
   END;
 
 CREATE OR REPLACE MASKING POLICY dob_mask AS (val date) RETURNS date ->
   CASE
-    WHEN CURRENT_ROLE() IN ('EHDIP_COMPLIANCE_OFFICER') THEN val
-    ELSE DATE_TRUNC('YEAR', val) -- Mask to only show the year
+    WHEN CURRENT_ROLE() IN ('CLINICIAN') THEN val
+    -- Data analysts only need the year for aggregate metrics
+    WHEN CURRENT_ROLE() IN ('DATA_ANALYST') THEN DATE_TRUNC('year', val)
+    ELSE NULL
   END;
 
--- 3. Apply Masking Policies to Tables (Assuming view or table exists)
--- E.g., ALTER TABLE gold_patient_profiles MODIFY COLUMN ssn SET MASKING POLICY ssn_mask;
--- ALTER TABLE gold_patient_profiles MODIFY COLUMN mrn SET MASKING POLICY mrn_mask;
--- ALTER TABLE gold_patient_profiles MODIFY COLUMN dob SET MASKING POLICY dob_mask;
-
--- 4. Grant Permissions
-GRANT USAGE ON DATABASE ehdip TO ROLE ehdip_data_scientist;
-GRANT USAGE ON SCHEMA ehdip.gold TO ROLE ehdip_data_scientist;
-GRANT SELECT ON ALL TABLES IN SCHEMA ehdip.gold TO ROLE ehdip_data_scientist;
-
-GRANT USAGE ON DATABASE ehdip TO ROLE ehdip_data_analyst;
-GRANT USAGE ON SCHEMA ehdip.gold TO ROLE ehdip_data_analyst;
-GRANT SELECT ON ALL TABLES IN SCHEMA ehdip.gold TO ROLE ehdip_data_analyst;
+-- 4. Apply Masking Policies to Silver Tables
+-- Assuming the Silver person table has these raw fields before full de-id in this scenario,
+-- or this applies to views on top of Silver.
+ALTER TABLE EHDIP_PROD.SILVER.person MODIFY COLUMN ssn_masked SET MASKING POLICY ssn_mask;
+ALTER TABLE EHDIP_PROD.SILVER.person MODIFY COLUMN mrn_masked SET MASKING POLICY mrn_mask;
+ALTER TABLE EHDIP_PROD.SILVER.person MODIFY COLUMN birth_datetime SET MASKING POLICY dob_mask;

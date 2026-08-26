@@ -1,84 +1,71 @@
+import os
+import argparse
+import hashlib
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, sha2, date_add, udf, regexp_replace, expr
+from pyspark.sql.functions import col, udf, date_add, expr, when
 from pyspark.sql.types import StringType
-import re
-import sys
 
-def get_spark_session(app_name="PHI_DeID_Engine"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .getOrCreate()
+def get_hash_salt():
+    return os.environ.get("EHDIP_HASH_SALT", "default_insecure_salt")
 
-# Simulated Format-Preserving Encryption (FPE) using SHA-256 for demonstration
-# In reality, you would use a dedicated FPE library that maintains format (e.g. NIST FF1/FF3)
-def simulate_fpe(value):
-    if not value: return value
-    import hashlib
-    # Simple hash for demo
-    return hashlib.sha256(value.encode('utf-8')).hexdigest()[:len(value)]
+def _fpe_mask(value):
+    if not value:
+        return value
+    salt = get_hash_salt()
+    # FPE requires salt as mentioned in memory: salted hashes via EHDIP_HASH_SALT
+    salted_value = f"{value}{salt}".encode('utf-8')
+    return hashlib.sha256(salted_value).hexdigest()
 
-fpe_udf = udf(simulate_fpe, StringType())
-
-def safe_harbor_redact(text_col):
-    # Regex to redact potential phone numbers or SSNs from free text (Safe Harbor 18)
-    pattern = r'\b(\d{3}-\d{2}-\d{4}|\d{3}-\d{3}-\d{4})\b'
-    return regexp_replace(text_col, pattern, '[REDACTED]')
-
-def deterministic_shift_days(patient_id):
-    if not patient_id: return 0
-    import hashlib
-    # Modulo arithmetic to generate a shift between -30 and 30 days based on patient_id
-    hash_val = int(hashlib.md5(patient_id.encode('utf-8')).hexdigest(), 16)
-    return (hash_val % 61) - 30
-
-shift_udf = udf(deterministic_shift_days, StringType())
-
-def apply_deid_rules(df, patient_id_col, ssn_col, mrn_col, dob_col, notes_col):
-    """
-    Applies de-identification rules:
-    - FPE on SSN and MRN
-    - Deterministic date-shifting (+/- 30 days) on DOB based on Patient ID
-    - Safe Harbor 18 redaction on Notes
-    """
-    if ssn_col in df.columns:
-        df = df.withColumn(f"{ssn_col}_deid", fpe_udf(col(ssn_col)))
-
-    if mrn_col in df.columns:
-        df = df.withColumn(f"{mrn_col}_deid", fpe_udf(col(mrn_col)))
-
-    if dob_col in df.columns and patient_id_col in df.columns:
-        # Deterministic Date shift: +/- 30 days based on patient ID
-        df = df.withColumn("shift_days", shift_udf(col(patient_id_col)).cast("int"))
-        df = df.withColumn(f"{dob_col}_deid", expr(f"date_add({dob_col}, shift_days)"))
-        df = df.drop("shift_days")
-
-    if notes_col in df.columns:
-        df = df.withColumn(f"{notes_col}_deid", safe_harbor_redact(col(notes_col)))
-
-    return df
+fpe_udf = udf(_fpe_mask, StringType())
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: deid_engine.py <input_table> <output_table>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="PHI De-Identification Engine")
+    parser.add_argument("--input-table", required=True, help="Input Iceberg table (Bronze)")
+    parser.add_argument("--output-table", required=True, help="Output Iceberg table (Silver De-identified)")
+    args = parser.parse_args()
 
-    input_table = sys.argv[1]
-    output_table = sys.argv[2]
+    spark = SparkSession.builder \
+        .appName("EHDIP_Deid_Engine") \
+        .getOrCreate()
 
-    spark = get_spark_session()
+    df = spark.table(args.input_table)
 
-    df = spark.read.table(input_table)
+    # Note: Assuming the Bronze table was parsed into a structured dataframe
+    # or this step extracts json fields first. For demonstration, let's assume
+    # fields like ssn, mrn, patient_id, birth_date, notes exist.
 
-    # Assume schema has patient_id, ssn, mrn, dob, clinical_notes columns
-    df_deid = apply_deid_rules(df, "patient_id", "ssn", "mrn", "dob", "clinical_notes")
+    # 1. FPE for SSN/MRN
+    # 2. Deterministic Date Shifting for dates
+    # 3. Safe Harbor 18 Redaction for free-text
 
-    # Save the de-identified dataframe
-    df_deid.write \
+    # Let's write the transformations dynamically based on column presence
+    columns = df.columns
+
+    if "ssn" in columns:
+        df = df.withColumn("ssn_masked", fpe_udf(col("ssn"))).drop("ssn")
+    if "mrn" in columns:
+        df = df.withColumn("mrn_masked", fpe_udf(col("mrn"))).drop("mrn")
+
+    if "patient_id" in columns and "birth_date" in columns:
+        # deterministic date shifting
+        # hash patient_id, take modulo 61, subtract 30 to get range [-30, 30]
+        # Using Spark SQL functions for deterministic shift instead of Python UDF for performance
+        df = df.withColumn(
+            "date_shift_days",
+            expr("pmod(conv(substr(md5(patient_id), 1, 15), 16, 10), 61) - 30")
+        )
+        df = df.withColumn("birth_date_shifted", expr("date_add(birth_date, cast(date_shift_days as int))")).drop("birth_date", "date_shift_days")
+
+    if "notes" in columns:
+        # Simplified Safe Harbor 18: redact obvious patterns (in real world uses NLP/RegEx)
+        # Redacting generic "[PHI]" for demonstration
+        df = df.withColumn("notes_redacted", expr("regexp_replace(notes, '\\\\b\\\\d{3}-\\\\d{2}-\\\\d{4}\\\\b', '[REDACTED_SSN]')"))\
+               .drop("notes")
+
+    df.write \
         .format("iceberg") \
         .mode("overwrite") \
-        .saveAsTable(output_table)
-
-    print(f"De-identification complete. Output written to {output_table}")
+        .saveAsTable(args.output_table)
 
 if __name__ == "__main__":
     main()

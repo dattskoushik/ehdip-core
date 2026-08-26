@@ -1,48 +1,59 @@
+import argparse
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, current_timestamp, lit, from_json, expr
-from pyspark.sql.types import StructType, StructField, StringType
-import sys
-
-def get_spark_session(app_name="Debezium_CDC_Consumer"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
-        .getOrCreate()
-
-def process_cdc_batch(spark, input_path, output_table):
-    # Debezium CDC records generally have 'before', 'after', 'op'
-    # We load raw JSON, extract CDC operation metadata, and land in Bronze.
-    df_raw = spark.read.json(input_path)
-
-    # Assuming typical Debezium payload structure
-    df_parsed = df_raw \
-        .withColumn("payload_id", expr("uuid()")) \
-        .withColumn("source_system_id", lit("DEBEZIUM_CDC")) \
-        .withColumn("raw_payload_json", expr("to_json(struct(*))")) \
-        .withColumn("ingestion_timestamp", current_timestamp())
-
-    df_final = df_parsed.select("payload_id", "source_system_id", "raw_payload_json", "ingestion_timestamp")
-
-    # Append to Bronze
-    df_final.write \
-        .format("iceberg") \
-        .mode("append") \
-        .saveAsTable(output_table)
-
-    print(f"Successfully processed CDC batch from {input_path} into {output_table}")
+from pyspark.sql.functions import col, from_json, current_timestamp, lit
+from pyspark.sql.types import StringType, StructType, StructField
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: cdc_consumer.py <input_s3_path> <output_iceberg_table>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Debezium CDC Consumer to Bronze Iceberg")
+    parser.add_argument("--kafka-brokers", required=True, help="Kafka broker connection string")
+    parser.add_argument("--kafka-topic", required=True, help="Kafka topic to consume CDC logs from")
+    parser.add_argument("--bronze-table", required=True, help="Target Bronze Iceberg table")
+    parser.add_argument("--checkpoint-location", required=True, help="S3 path for streaming checkpoint")
+    args = parser.parse_args()
 
-    input_path = sys.argv[1]
-    output_table = sys.argv[2]
+    spark = SparkSession.builder \
+        .appName("EHDIP_CDC_Consumer") \
+        .getOrCreate()
 
-    spark = get_spark_session()
-    process_cdc_batch(spark, input_path, output_table)
+    # Debezium CDC payload structure
+    debezium_schema = StructType([
+        StructField("payload", StructType([
+            StructField("before", StringType(), True),
+            StructField("after", StringType(), True),
+            StructField("op", StringType(), True),
+            StructField("source", StructType([
+                StructField("ts_ms", StringType(), True)
+            ]), True)
+        ]), True)
+    ])
+
+    df = spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", args.kafka_brokers) \
+        .option("subscribe", args.kafka_topic) \
+        .option("startingOffsets", "earliest") \
+        .load()
+
+    # Parse CDC and filter relevant operations
+    parsed_df = df.selectExpr("CAST(value AS STRING) as value_str") \
+        .withColumn("debezium", from_json(col("value_str"), debezium_schema)) \
+        .filter(col("debezium.payload.op").isin("c", "u", "d")) \
+        .select(
+            current_timestamp().alias("ingestion_timestamp"),
+            lit("DEBEZIUM_CDC").alias("source_system_id"),
+            # For simplistic raw storage, we just dump the JSON payload
+            col("value_str").alias("raw_payload_json")
+        ) \
+        .withColumn("payload_id", expr("uuid()")) \
+        .select("ingestion_timestamp", "source_system_id", "payload_id", "raw_payload_json")
+
+    query = parsed_df.writeStream \
+        .format("iceberg") \
+        .outputMode("append") \
+        .option("checkpointLocation", args.checkpoint_location) \
+        .toTable(args.bronze_table)
+
+    query.awaitTermination()
 
 if __name__ == "__main__":
     main()

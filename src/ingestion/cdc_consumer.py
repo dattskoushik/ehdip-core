@@ -1,48 +1,46 @@
+import argparse
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, current_timestamp, lit, from_json, expr
-from pyspark.sql.types import StructType, StructField, StringType
-import sys
+from pyspark.sql.functions import current_timestamp, lit, col
 
-def get_spark_session(app_name="Debezium_CDC_Consumer"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
+def process_cdc(spark, input_path, iceberg_table):
+    """
+    Processes Debezium CDC change logs.
+    Filters operations and merges to Bronze Iceberg.
+    """
+    # Read CDC JSON files
+    df = spark.read.json(input_path)
+
+    # Filter for standard CDC operations
+    cdc_filtered_df = df.filter(col("_cdc_op").isin('c', 'u', 'd'))
+
+    bronze_df = cdc_filtered_df.select(
+        current_timestamp().alias("ingestion_timestamp"),
+        lit("DEBEZIUM_CDC").alias("source_system_id"),
+        col("payload").cast("string").alias("raw_payload_json") # simplified
+    )
+
+    bronze_df.createOrReplaceTempView("cdc_updates")
+
+    # Enforce idempotent writes by registering DataFrames as temporary views and executing MERGE INTO
+    merge_query = f"""
+    MERGE INTO {iceberg_table} t
+    USING cdc_updates s
+    ON t.raw_payload_json = s.raw_payload_json
+    WHEN NOT MATCHED THEN INSERT *
+    """
+
+    spark.sql(merge_query)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Debezium CDC Ingestion")
+    parser.add_argument("--input-path", required=True, help="S3 path to Debezium CDC JSON files")
+    parser.add_argument("--iceberg-table", required=True, help="Target Iceberg table")
+
+    args = parser.parse_args()
+
+    spark = SparkSession.builder \
+        .appName("EHDIP_Batch_CDC_Ingestion") \
         .getOrCreate()
 
-def process_cdc_batch(spark, input_path, output_table):
-    # Debezium CDC records generally have 'before', 'after', 'op'
-    # We load raw JSON, extract CDC operation metadata, and land in Bronze.
-    df_raw = spark.read.json(input_path)
-
-    # Assuming typical Debezium payload structure
-    df_parsed = df_raw \
-        .withColumn("payload_id", expr("uuid()")) \
-        .withColumn("source_system_id", lit("DEBEZIUM_CDC")) \
-        .withColumn("raw_payload_json", expr("to_json(struct(*))")) \
-        .withColumn("ingestion_timestamp", current_timestamp())
-
-    df_final = df_parsed.select("payload_id", "source_system_id", "raw_payload_json", "ingestion_timestamp")
-
-    # Append to Bronze
-    df_final.write \
-        .format("iceberg") \
-        .mode("append") \
-        .saveAsTable(output_table)
-
-    print(f"Successfully processed CDC batch from {input_path} into {output_table}")
-
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: cdc_consumer.py <input_s3_path> <output_iceberg_table>")
-        sys.exit(1)
-
-    input_path = sys.argv[1]
-    output_table = sys.argv[2]
-
-    spark = get_spark_session()
-    process_cdc_batch(spark, input_path, output_table)
-
-if __name__ == "__main__":
-    main()
+    process_cdc(spark, args.input_path, args.iceberg_table)

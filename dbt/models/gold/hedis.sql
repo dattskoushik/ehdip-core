@@ -1,29 +1,30 @@
--- dbt model: HEDIS Measures (Gold Mart)
-{{ config(
-    materialized='table',
-    schema='gold'
-) }}
+-- dbt/models/gold/hedis.sql
+-- HEDIS Quality Measures (e.g., Controlling High Blood Pressure)
 
-WITH diabetic_patients AS (
+{{ config(materialized='table') }}
+
+WITH hypertension_patients AS (
     SELECT DISTINCT person_id
-    FROM {{ source('ehdip_silver', 'condition_occurrence') }}
-    WHERE condition_concept_id = 201820 -- Diabetes
+    FROM {{ source('silver', 'omop_condition_occurrence') }}
+    WHERE condition_concept_id IN (316866, 31967) -- Mock SNOMED for Hypertension
 ),
-
-hba1c_tests AS (
+blood_pressure_readings AS (
     SELECT
         person_id,
         measurement_date,
-        value_as_number
-    FROM {{ source('ehdip_silver', 'measurement') }}
-    WHERE measurement_concept_id = 3004410 -- HbA1c
+        value_as_number AS systolic_bp
+    FROM {{ source('silver', 'omop_measurement') }} -- Assuming measurement table
+    WHERE measurement_concept_id = 3004249 -- Systolic blood pressure
 )
 
 SELECT
-    d.person_id,
-    CASE WHEN h.person_id IS NOT NULL THEN 1 ELSE 0 END as had_hba1c_test,
-    MAX(h.measurement_date) as last_test_date,
-    MAX(h.value_as_number) as last_test_value
-FROM diabetic_patients d
-LEFT JOIN hba1c_tests h ON d.person_id = h.person_id
-GROUP BY d.person_id, CASE WHEN h.person_id IS NOT NULL THEN 1 ELSE 0 END
+    hp.person_id,
+    MAX(bp.measurement_date) AS latest_bp_date,
+    MAX_BY(bp.systolic_bp, bp.measurement_date) AS latest_systolic,
+    CASE
+        WHEN MAX_BY(bp.systolic_bp, bp.measurement_date) < 140 THEN TRUE
+        ELSE FALSE
+    END AS is_controlled
+FROM hypertension_patients hp
+LEFT JOIN blood_pressure_readings bp ON hp.person_id = bp.person_id
+GROUP BY hp.person_id

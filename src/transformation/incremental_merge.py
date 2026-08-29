@@ -1,44 +1,49 @@
+import argparse
 from pyspark.sql import SparkSession
-import sys
+from pyspark.sql.window import Window
+from pyspark.sql.functions import row_number, col, desc
 
-def get_spark_session(app_name="Incremental_CDC_Merge"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
+def apply_incremental_merge(spark, updates_table, target_iceberg_table, primary_key, sort_key):
+    """
+    Applies incremental updates handling out-of-order CDC updates via `updated_at` (or sort_key).
+    Performs partition-pruned MERGE INTO on Iceberg Silver tables.
+    """
+
+    updates_df = spark.table(updates_table)
+
+    # 1. Deduplicate updates keeping only the latest per primary key
+    window_spec = Window.partitionBy(primary_key).orderBy(desc(sort_key))
+    latest_updates_df = updates_df.withColumn("rn", row_number().over(window_spec)) \
+                                  .filter(col("rn") == 1) \
+                                  .drop("rn")
+
+    # Register as temp view for the merge query
+    latest_updates_df.createOrReplaceTempView("latest_updates")
+
+    # 2. Perform idempotent MERGE INTO
+    # Assuming the target table is partitioned, Iceberg will automatically prune partitions
+    merge_query = f"""
+    MERGE INTO {target_iceberg_table} t
+    USING latest_updates s
+    ON t.{primary_key} = s.{primary_key}
+    WHEN MATCHED AND t.{sort_key} < s.{sort_key} THEN UPDATE SET *
+    WHEN NOT MATCHED THEN INSERT *
+    """
+
+    spark.sql(merge_query)
+    print(f"Incremental merge into {target_iceberg_table} complete.")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Incremental CDC Upsert Engine")
+    parser.add_argument("--updates-table", required=True, help="Input table with latest CDC/batch updates")
+    parser.add_argument("--target-iceberg-table", required=True, help="Target Silver Iceberg table")
+    parser.add_argument("--primary-key", required=True, help="Primary key column for merge condition")
+    parser.add_argument("--sort-key", required=True, help="Column to sort by for latest record (e.g., updated_at)")
+
+    args = parser.parse_args()
+
+    spark = SparkSession.builder \
+        .appName("EHDIP_Incremental_Merge") \
         .getOrCreate()
 
-def merge_cdc(spark, cdc_view, target_table):
-    """
-    Performs an incremental MERGE INTO target_table using cdc_view data.
-    Assumes cdc_view has _cdc_op ('c', 'u', 'd') and updated_at to resolve out-of-order events.
-    """
-    merge_sql = f"""
-    MERGE INTO {target_table} t
-    USING {cdc_view} s
-    ON t.payload_id = s.payload_id
-    WHEN MATCHED AND s._cdc_op = 'd' AND s.updated_at >= t.updated_at THEN
-        DELETE
-    WHEN MATCHED AND s._cdc_op IN ('c', 'u') AND s.updated_at >= t.updated_at THEN
-        UPDATE SET *
-    WHEN NOT MATCHED AND s._cdc_op IN ('c', 'u') THEN
-        INSERT *
-    """
-
-    spark.sql(merge_sql)
-    print(f"Merge operation completed on {target_table}")
-
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: incremental_merge.py <cdc_temp_view> <target_iceberg_table>")
-        sys.exit(1)
-
-    cdc_view = sys.argv[1]
-    target_table = sys.argv[2]
-
-    spark = get_spark_session()
-    merge_cdc(spark, cdc_view, target_table)
-
-if __name__ == "__main__":
-    main()
+    apply_incremental_merge(spark, args.updates_table, args.target_iceberg_table, args.primary_key, args.sort_key)

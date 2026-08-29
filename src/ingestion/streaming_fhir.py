@@ -1,68 +1,51 @@
-import sys
+import argparse
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, current_timestamp, expr
-from pyspark.sql.types import StructType, StructField, StringType, MapType
+from pyspark.sql.functions import current_timestamp, lit, col, struct, to_json
+from pyspark.sql.types import StringType
 
-def get_spark_session(app_name="StreamingFHIR_Ingestion"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
+def main(kafka_brokers, kafka_topic, iceberg_table, checkpoint_location):
+    # EMR Serverless applications need a spark session initialized
+    spark = SparkSession.builder \
+        .appName("EHDIP_Streaming_FHIR_Ingestion") \
         .getOrCreate()
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: streaming_fhir.py <kafka_bootstrap_servers> <kafka_topic>")
-        sys.exit(1)
+    spark.sparkContext.setLogLevel("WARN")
 
-    kafka_bootstrap_servers = sys.argv[1]
-    kafka_topic = sys.argv[2]
-
-    spark = get_spark_session()
-
-    # Define schema for incoming FHIR JSON (simplified for dynamic payload)
-    # Using MapType to handle schema evolution naturally or string to hold raw JSON
-    schema = StructType([
-        StructField("id", StringType(), True),
-        StructField("resourceType", StringType(), True)
-    ])
-
-    # Read from Kafka/MSK
-    df_stream = spark.readStream \
+    # Read from MSK / Kafka (SASL/SCRAM assumed configured in env)
+    df = spark \
+        .readStream \
         .format("kafka") \
-        .option("kafka.bootstrap.servers", kafka_bootstrap_servers) \
+        .option("kafka.bootstrap.servers", kafka_brokers) \
         .option("subscribe", kafka_topic) \
-        .option("kafka.security.protocol", "SASL_SSL") \
-        .option("kafka.sasl.mechanism", "SCRAM-SHA-512") \
         .option("startingOffsets", "earliest") \
         .load()
 
-    # Parse JSON payload and construct audit fields
-    # Keep the raw payload JSON to support schema evolution
-    parsed_df = df_stream \
-        .selectExpr("CAST(value AS STRING) as raw_payload_json") \
-        .withColumn("ingestion_timestamp", current_timestamp()) \
-        .withColumn("source_system_id", expr("'AWS_MSK_FHIR_TOPIC'")) \
-        .withColumn("payload_id", expr("uuid()"))
-
-    # Select columns matching the Bronze schema
-    final_df = parsed_df.select(
-        "payload_id",
-        "source_system_id",
-        "raw_payload_json",
-        "ingestion_timestamp"
+    # Add audit metadata
+    bronze_df = df.select(
+        current_timestamp().alias("ingestion_timestamp"),
+        lit("MSK_FHIR_STREAM").alias("source_system_id"),
+        col("key").cast(StringType()).alias("payload_id"),
+        col("value").cast(StringType()).alias("raw_payload_json")
     )
 
-    # Write stream to Iceberg Bronze table
-    query = final_df.writeStream \
+    # Write to Bronze Iceberg table using append
+    # In streaming context, append is standard for bronze ingestion
+    query = bronze_df \
+        .writeStream \
         .format("iceberg") \
         .outputMode("append") \
-        .trigger(processingTime="1 minute") \
-        .option("checkpointLocation", "s3://ehdip-bronze-raw/checkpoints/fhir_ingestion/") \
-        .toTable("glue_catalog.ehdip_data_lake.bronze_raw_payloads")
+        .option("checkpointLocation", checkpoint_location) \
+        .toTable(iceberg_table)
 
     query.awaitTermination()
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Streaming FHIR Ingestion from MSK to Iceberg")
+    parser.add_argument("--kafka-brokers", required=True, help="Kafka bootstrap servers")
+    parser.add_argument("--kafka-topic", required=True, help="Kafka topic to consume")
+    parser.add_argument("--iceberg-table", required=True, help="Target Iceberg table (e.g. ehdip_bronze.bronze_raw_payload)")
+    parser.add_argument("--checkpoint-location", required=True, help="S3 path for stream checkpointing")
+
+    args = parser.parse_args()
+
+    main(args.kafka_brokers, args.kafka_topic, args.iceberg_table, args.checkpoint_location)

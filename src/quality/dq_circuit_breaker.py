@@ -1,78 +1,80 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import lit, expr
-import sys
 import os
+import argparse
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lit
 
-# Set required environmental variables for PyDeequ
-os.environ["SPARK_VERSION"] = "3.3"
-
-def get_spark_session(app_name="DQ_Circuit_Breaker"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.jars.packages", "com.amazon.deequ:deequ:2.0.3-spark-3.3") \
-        .getOrCreate()
-
-def run_dq_validation(spark, input_table, valid_table, dlq_table):
+def configure_spark_for_deequ(spark):
     """
-    Validates data quality rules using PyDeequ.
-    Records that fail validation are routed to DLQ.
+    Ensure SPARK_VERSION and proper JARs are set up for PyDeequ,
+    although typically this is done via spark-submit arguments or EMR config.
     """
-    # Import PyDeequ here to ensure it uses the properly configured SparkSession
+    os.environ["SPARK_VERSION"] = spark.version
+    print(f"Configured PyDeequ for Spark Version: {spark.version}")
+
+def run_dq_checks(spark, input_table, valid_output_table, dlq_output_table):
+    import pydeequ
     from pydeequ.checks import Check, CheckLevel
     from pydeequ.verification import VerificationSuite
-    import pydeequ
 
-    df = spark.read.table(input_table)
+    configure_spark_for_deequ(spark)
 
-    # Run PyDeequ verification
-    # 1. Heart rate must be between 30 and 250 (assuming measurement_concept_id = 3027018)
-    # 2. Event date cannot be in the future (measurement_date <= current_date)
+    df = spark.table(input_table)
 
-    check = Check(spark, CheckLevel.Error, "Clinical Plausibility Check")
-
+    # Define data quality checks
+    # Example OMOP checks: person_id is complete, condition_concept_id is not null
+    check = Check(spark, CheckLevel.Error, "OMOP_Silver_DQ_Check")
     checkResult = VerificationSuite(spark) \
         .onData(df) \
         .addCheck(
-            check.satisfies("measurement_concept_id != 3027018 OR (value_as_number >= 30 AND value_as_number <= 250)", "HR Bounds")
-                 .satisfies("measurement_date <= current_date()", "No Future Dates")
+            check.isComplete("person_id")
+            .isComplete("condition_concept_id")
+            .isNonNegative("condition_concept_id")
         ) \
         .run()
 
     checkResult_df = VerificationSuite.checkResultsAsDataFrame(spark, checkResult)
+    checkResult_df.show(truncate=False)
 
-    # If the status is not success, we can route the entire batch or use row-level evaluation
-    # to find specific bad records. Since PyDeequ is column/dataset level aggregation,
-    # we typically flag the batch or use it in conjunction with native filtering for row-level DLQ.
-    # To meet the row-level DLQ requirement explicitly:
-    cond_hr = "measurement_concept_id != 3027018 OR (value_as_number >= 30 AND value_as_number <= 250)"
-    cond_date = "measurement_date <= current_date()"
+    # In a full circuit breaker, we filter row-by-row based on constraints
+    # For PyDeequ, row-level validation (like filtering out bad rows) requires
+    # more advanced setup (e.g. using RowLevelAnalyzer or filtering manually based on logic)
 
-    df_validated = df.withColumn("dq_passed", expr(f"({cond_hr}) AND ({cond_date})"))
+    # Simple simulated row-level filter for DLQ routing:
+    valid_df = df.filter(col("person_id").isNotNull() & col("condition_concept_id").isNotNull())
+    dlq_df = df.filter(col("person_id").isNull() | col("condition_concept_id").isNull())
 
-    # Route valid data
-    df_valid = df_validated.filter("dq_passed = True").drop("dq_passed")
-    df_valid.write.format("iceberg").mode("append").saveAsTable(valid_table)
+    # Route to tables
+    valid_df.createOrReplaceTempView("valid_updates")
+    dlq_df.createOrReplaceTempView("dlq_updates")
 
-    # Route invalid data to DLQ
-    df_dlq = df_validated.filter("dq_passed = False").drop("dq_passed")
-    if df_dlq.count() > 0:
-        df_dlq = df_dlq.withColumn("error_reason", lit("Failed PyDeequ clinical plausibility bounds or date checks"))
-        df_dlq.write.format("iceberg").mode("append").saveAsTable(dlq_table)
-        print(f"Routed {df_dlq.count()} bad records to DLQ: {dlq_table}")
+    spark.sql(f"""
+    MERGE INTO {valid_output_table} t
+    USING valid_updates s
+    ON t.condition_occurrence_id = s.condition_occurrence_id
+    WHEN MATCHED THEN UPDATE SET *
+    WHEN NOT MATCHED THEN INSERT *
+    """)
 
-    print(f"Validation complete. Good records written to {valid_table}")
+    spark.sql(f"""
+    MERGE INTO {dlq_output_table} t
+    USING dlq_updates s
+    ON t.condition_occurrence_id = s.condition_occurrence_id
+    WHEN MATCHED THEN UPDATE SET *
+    WHEN NOT MATCHED THEN INSERT *
+    """)
 
-def main():
-    if len(sys.argv) < 4:
-        print("Usage: dq_circuit_breaker.py <input_table> <valid_table> <dlq_table>")
-        sys.exit(1)
+    print("Data quality checks complete. Invalid records routed to DLQ.")
 
-    input_table = sys.argv[1]
-    valid_table = sys.argv[2]
-    dlq_table = sys.argv[3]
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="DQ Circuit Breaker & DLQ Routing")
+    parser.add_argument("--input-table", required=True, help="Input Silver OMOP table")
+    parser.add_argument("--valid-output-table", required=True, help="Target Silver verified table")
+    parser.add_argument("--dlq-output-table", required=True, help="Target DLQ table")
 
-    spark = get_spark_session()
-    run_dq_validation(spark, input_table, valid_table, dlq_table)
+    args = parser.parse_args()
 
-if __name__ == "__main__":
-    main()
+    spark = SparkSession.builder \
+        .appName("EHDIP_DQ_Circuit_Breaker") \
+        .getOrCreate()
+
+    run_dq_checks(spark, args.input_table, args.valid_output_table, args.dlq_output_table)

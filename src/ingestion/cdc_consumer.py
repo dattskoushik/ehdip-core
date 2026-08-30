@@ -1,48 +1,44 @@
+import argparse
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, current_timestamp, lit, from_json, expr
-from pyspark.sql.types import StructType, StructField, StringType
-import sys
+from pyspark.sql.functions import col, from_json, to_json, struct, current_timestamp, lit
+from pyspark.sql.types import StructType, StructField, StringType, MapType
 
-def get_spark_session(app_name="Debezium_CDC_Consumer"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
-        .getOrCreate()
+def consume_cdc(spark, input_path, output_table):
+    # Read Debezium JSON CDC logs
+    # Assume schema has 'op' for operation and 'after' for payload
+    schema = StructType([
+        StructField("op", StringType(), True),
+        StructField("after", MapType(StringType(), StringType()), True),
+        StructField("before", MapType(StringType(), StringType()), True),
+        StructField("source", MapType(StringType(), StringType()), True)
+    ])
 
-def process_cdc_batch(spark, input_path, output_table):
-    # Debezium CDC records generally have 'before', 'after', 'op'
-    # We load raw JSON, extract CDC operation metadata, and land in Bronze.
-    df_raw = spark.read.json(input_path)
+    df = spark.read.json(input_path, schema=schema)
 
-    # Assuming typical Debezium payload structure
-    df_parsed = df_raw \
-        .withColumn("payload_id", expr("uuid()")) \
-        .withColumn("source_system_id", lit("DEBEZIUM_CDC")) \
-        .withColumn("raw_payload_json", expr("to_json(struct(*))")) \
-        .withColumn("ingestion_timestamp", current_timestamp())
+    # Filter for C, U, D ops
+    cdc_df = df.filter(col("op").isin("c", "u", "d"))
 
-    df_final = df_parsed.select("payload_id", "source_system_id", "raw_payload_json", "ingestion_timestamp")
+    # Extract payload and metadata
+    parsed_df = cdc_df.withColumn("payload_id", col("after.id")) \
+        .withColumn("raw_payload_json", to_json(col("after"))) \
+        .withColumn("ingestion_timestamp", current_timestamp()) \
+        .withColumn("source_system_id", lit("debezium_cdc")) \
+        .select("ingestion_timestamp", "source_system_id", "payload_id", "raw_payload_json")
 
-    # Append to Bronze
-    df_final.write \
+    # Write to Bronze Iceberg
+    parsed_df.write \
         .format("iceberg") \
         .mode("append") \
         .saveAsTable(output_table)
 
-    print(f"Successfully processed CDC batch from {input_path} into {output_table}")
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_path", required=True, help="Path to Debezium JSON logs")
+    parser.add_argument("--output_table", required=True, help="Iceberg table name")
+    args = parser.parse_args()
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: cdc_consumer.py <input_s3_path> <output_iceberg_table>")
-        sys.exit(1)
+    spark = SparkSession.builder \
+        .appName("CDC_Consumer") \
+        .getOrCreate()
 
-    input_path = sys.argv[1]
-    output_table = sys.argv[2]
-
-    spark = get_spark_session()
-    process_cdc_batch(spark, input_path, output_table)
-
-if __name__ == "__main__":
-    main()
+    consume_cdc(spark, args.input_path, args.output_table)

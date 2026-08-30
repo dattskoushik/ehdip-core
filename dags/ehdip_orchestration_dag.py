@@ -1,13 +1,17 @@
-from airflow import DAG
-from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
-from airflow.providers.dbt.cloud.operators.dbt import DbtCloudRunJobOperator
 from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.providers.amazon.aws.operators.emr import EmrServerlessStartJobOperator
+from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
+from airflow.models import Variable
 
-# EHDIP Orchestration DAG for Batch Processing
+# EMR Serverless App ID and Role ARN
+emr_serverless_app_id = Variable.get("EMR_SERVERLESS_APP_ID", default_var="mock-app-id")
+emr_serverless_role_arn = Variable.get("EMR_SERVERLESS_ROLE_ARN", default_var="arn:aws:iam::123:role/mock-role")
+s3_bucket = "s3://ehdip-artifacts"
+
 default_args = {
-    'owner': 'ehdip_engineering',
+    'owner': 'ehdip_data_eng',
     'depends_on_past': False,
-    'start_date': datetime(2023, 1, 1),
     'email_on_failure': True,
     'email_on_retry': False,
     'retries': 1,
@@ -15,60 +19,94 @@ default_args = {
 }
 
 with DAG(
-    'ehdip_end_to_end_pipeline',
+    'ehdip_orchestration_dag',
     default_args=default_args,
-    description='EHDIP Data Pipeline: Bronze -> Silver -> DQ -> Gold',
+    description='EHDIP End-to-End Orchestration',
     schedule_interval=timedelta(days=1),
+    start_date=datetime(2023, 1, 1),
     catchup=False,
-    tags=['ehdip', 'production'],
-    # OpenLineage integration is typically configured at the Airflow cluster level
-    # (e.g. MWAA environment variables for AIRFLOW__LINEAGE__BACKEND)
+    tags=['ehdip', 'production', 'openlineage'],
 ) as dag:
 
-    # 1. Ingestion to Bronze (Batch X12 as an example)
-    ingest_bronze = SparkSubmitOperator(
-        task_id='ingest_to_bronze',
-        application='src/ingestion/x12_batch_parser.py',
-        application_args=['s3://ehdip-landing/x12/latest/', 'glue_catalog.ehdip_data_lake.bronze_raw_payloads'],
-        conf={'spark.openlineage.namespace': 'ehdip-prod'}
+    # 1. Batch Ingestion (X12)
+    ingest_x12 = EmrServerlessStartJobOperator(
+        task_id='ingest_x12',
+        application_id=emr_serverless_app_id,
+        execution_role_arn=emr_serverless_role_arn,
+        job_driver={
+            "sparkSubmit": {
+                "entryPoint": f"{s3_bucket}/scripts/x12_batch_parser.py",
+                "entryPointArguments": [
+                    "--input_path", "s3://ehdip-landing/x12/",
+                    "--output_table", "ehdip_bronze_db.raw_payloads"
+                ]
+            }
+        },
+        name="ingest_x12_job"
     )
 
-    # 2. De-identification
-    deidentify_phi = SparkSubmitOperator(
-        task_id='deidentify_phi',
-        application='src/security/deid_engine.py',
-        application_args=['glue_catalog.ehdip_data_lake.bronze_raw_payloads', 'glue_catalog.ehdip_data_lake.bronze_deid_payloads'],
-        conf={'spark.openlineage.namespace': 'ehdip-prod'}
+    # 2. De-Identification
+    deid_job = EmrServerlessStartJobOperator(
+        task_id='deid_job',
+        application_id=emr_serverless_app_id,
+        execution_role_arn=emr_serverless_role_arn,
+        job_driver={
+            "sparkSubmit": {
+                "entryPoint": f"{s3_bucket}/scripts/deid_engine.py",
+                "entryPointArguments": [
+                    "--input_table", "ehdip_bronze_db.raw_payloads",
+                    "--output_table", "ehdip_bronze_db.deid_payloads"
+                ]
+            }
+        },
+        name="deid_job"
     )
 
-    # 3. OMOP Transformation (Silver)
-    transform_silver = SparkSubmitOperator(
-        task_id='transform_silver_omop',
-        application='src/transformation/omop_silver_transformer.py',
-        application_args=['glue_catalog.ehdip_data_lake.bronze_deid_payloads', 'glue_catalog.ehdip_data_lake'],
-        conf={'spark.openlineage.namespace': 'ehdip-prod'}
+    # 3. OMOP Silver Transformation
+    omop_transform = EmrServerlessStartJobOperator(
+        task_id='omop_transform',
+        application_id=emr_serverless_app_id,
+        execution_role_arn=emr_serverless_role_arn,
+        job_driver={
+            "sparkSubmit": {
+                "entryPoint": f"{s3_bucket}/scripts/omop_silver_transformer.py",
+                "entryPointArguments": [
+                    "--input_table", "ehdip_bronze_db.deid_payloads",
+                    "--db_prefix", "ehdip_silver_db"
+                ]
+            }
+        },
+        name="omop_transform_job"
     )
 
-    # 4. Data Quality & DLQ Routing
-    data_quality_check = SparkSubmitOperator(
-        task_id='data_quality_validation',
-        application='src/quality/dq_circuit_breaker.py',
-        application_args=[
-            'glue_catalog.ehdip_data_lake.condition_occurrence',
-            'glue_catalog.ehdip_data_lake.condition_occurrence_valid',
-            'glue_catalog.ehdip_data_lake.condition_occurrence_dlq'
-        ],
-        conf={'spark.openlineage.namespace': 'ehdip-prod'}
+    # 4. Data Quality Checks & DLQ Routing
+    dq_checks = EmrServerlessStartJobOperator(
+        task_id='dq_checks',
+        application_id=emr_serverless_app_id,
+        execution_role_arn=emr_serverless_role_arn,
+        job_driver={
+            "sparkSubmit": {
+                "entryPoint": f"{s3_bucket}/scripts/dq_circuit_breaker.py",
+                "entryPointArguments": [
+                    "--input_table", "ehdip_silver_db.condition_occurrence_staging",
+                    "--valid_output", "ehdip_silver_db.condition_occurrence",
+                    "--dlq_output", "ehdip_silver_db.dlq_condition_occurrence"
+                ]
+            }
+        },
+        name="dq_checks_job"
     )
 
-    # 5. Run dbt Gold Models (Using dbt Cloud as an example in a modern stack)
-    # Alternatively, could be a BashOperator running dbt-core
-    run_dbt_gold = DbtCloudRunJobOperator(
-        task_id="run_dbt_gold_marts",
-        job_id=12345, # Simulated Job ID
-        check_interval=30,
-        timeout=300
+    # 5. Trigger Snowflake dbt runs (via SnowflakeOperator for demo, typically bash/dbt operator)
+    run_dbt_models = SnowflakeOperator(
+        task_id='trigger_gold_refresh',
+        snowflake_conn_id='snowflake_default',
+        sql="""
+        -- In reality this would be calling dbt cloud or running dbt CLI
+        -- Simulating refreshing dynamic tables manually if they weren't auto
+        ALTER DYNAMIC TABLE ehdip_gold.dt_readmissions_base REFRESH;
+        """
     )
 
-    # Define Dependencies
-    ingest_bronze >> deidentify_phi >> transform_silver >> data_quality_check >> run_dbt_gold
+    # Define dependencies
+    ingest_x12 >> deid_job >> omop_transform >> dq_checks >> run_dbt_models

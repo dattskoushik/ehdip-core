@@ -1,60 +1,48 @@
+import argparse
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, current_timestamp
-import sys
+from pyspark.sql.functions import col, lit, monotonically_increasing_id
 
-def get_spark_session(app_name="OMOP_Silver_Transformer"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
+def transform_to_omop(spark, input_table, db_prefix):
+    # Read de-identified flat records
+    df = spark.read.table(input_table)
+
+    # Very basic mock mapping to OMOP Condition Occurrence
+    # In reality, this would involve Athena vocabulary joins to map source codes to standard concept_ids
+    condition_df = df.filter(col("event_type") == "diagnosis") \
+        .withColumn("condition_occurrence_id", monotonically_increasing_id()) \
+        .withColumn("person_id", col("patient_id")) \
+        .withColumn("condition_concept_id", lit(0)) \
+        .withColumn("condition_start_date", col("event_date")) \
+        .withColumn("condition_source_value", col("code")) \
+        .select("condition_occurrence_id", "person_id", "condition_concept_id", "condition_start_date", "condition_source_value")
+
+    condition_df.write \
+        .format("iceberg") \
+        .mode("append") \
+        .saveAsTable(f"{db_prefix}.condition_occurrence")
+
+    # Drug Exposure mock mapping
+    drug_df = df.filter(col("event_type") == "medication") \
+        .withColumn("drug_exposure_id", monotonically_increasing_id()) \
+        .withColumn("person_id", col("patient_id")) \
+        .withColumn("drug_concept_id", lit(0)) \
+        .withColumn("drug_exposure_start_date", col("event_date")) \
+        .withColumn("drug_source_value", col("code")) \
+        .select("drug_exposure_id", "person_id", "drug_concept_id", "drug_exposure_start_date", "drug_source_value")
+
+    drug_df.write \
+        .format("iceberg") \
+        .mode("append") \
+        .saveAsTable(f"{db_prefix}.drug_exposure")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_table", required=True)
+    parser.add_argument("--db_prefix", required=True)
+    args = parser.parse_args()
+
+    spark = SparkSession.builder \
+        .appName("OMOP_Silver_Transformer") \
         .getOrCreate()
 
-def transform_to_omop(spark, input_table, output_database):
-    """
-    Transforms de-identified bronze payload to OMOP CDM v5.4 structure.
-    Simplified version focusing on structural mapping.
-    """
-    df_bronze = spark.read.table(input_table)
-
-    # 1. Map to condition_occurrence
-    # Assuming json parsing has already extracted relevant fields into columns
-    # like 'patient_id', 'condition_concept_id', 'condition_start_date'
-    if "condition_concept_id" in df_bronze.columns:
-        condition_df = df_bronze.select(
-            col("payload_id").alias("condition_occurrence_id"),
-            col("patient_id").alias("person_id"),
-            col("condition_concept_id"),
-            col("condition_start_date"),
-            col("condition_end_date"),
-            lit(32020).alias("condition_type_concept_id") # EHR
-        )
-        condition_df.write.format("iceberg").mode("append").saveAsTable(f"{output_database}.condition_occurrence")
-
-    # 2. Map to drug_exposure
-    if "drug_concept_id" in df_bronze.columns:
-        drug_df = df_bronze.select(
-            col("payload_id").alias("drug_exposure_id"),
-            col("patient_id").alias("person_id"),
-            col("drug_concept_id"),
-            col("drug_exposure_start_date"),
-            col("drug_exposure_end_date"),
-            lit(38000177).alias("drug_type_concept_id") # Prescription written
-        )
-        drug_df.write.format("iceberg").mode("append").saveAsTable(f"{output_database}.drug_exposure")
-
-    print(f"Successfully transformed and loaded OMOP tables to {output_database}")
-
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: omop_silver_transformer.py <input_bronze_table> <output_silver_db>")
-        sys.exit(1)
-
-    input_table = sys.argv[1]
-    output_database = sys.argv[2]
-
-    spark = get_spark_session()
-    transform_to_omop(spark, input_table, output_database)
-
-if __name__ == "__main__":
-    main()
+    transform_to_omop(spark, args.input_table, args.db_prefix)

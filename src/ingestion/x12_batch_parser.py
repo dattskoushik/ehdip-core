@@ -1,47 +1,33 @@
+import argparse
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, current_timestamp, lit, expr
-import sys
+from pyspark.sql.functions import col, current_timestamp, lit, split, monotonically_increasing_id
 
-def get_spark_session(app_name="X12_EDI_Batch_Parser"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
-        .getOrCreate()
+def parse_x12(spark, input_path, output_table):
+    # Read text file
+    df = spark.read.text(input_path)
 
-def process_x12_batch(spark, input_path, output_table):
-    # Read raw text lines
-    df_raw = spark.read.text(input_path)
-
-    # Simplified parsing for X12 (splitting by ~)
-    # In a real scenario, a dedicated X12 parser library would be used
-    df_parsed = df_raw \
-        .withColumn("payload_id", expr("uuid()")) \
-        .withColumn("source_system_id", lit("EDI_X12_BATCH")) \
+    # Very basic X12 split logic simulation for 837/835
+    parsed_df = df.withColumn("segments", split(col("value"), "~")) \
+        .withColumn("payload_id", monotonically_increasing_id().cast("string")) \
         .withColumn("raw_payload_json", col("value")) \
-        .withColumn("ingestion_timestamp", current_timestamp())
+        .withColumn("ingestion_timestamp", current_timestamp()) \
+        .withColumn("source_system_id", lit("x12_batch")) \
+        .select("ingestion_timestamp", "source_system_id", "payload_id", "raw_payload_json")
 
-    df_final = df_parsed.select("payload_id", "source_system_id", "raw_payload_json", "ingestion_timestamp")
-
-    # Append to Bronze Iceberg table
-    df_final.write \
+    # Write to Bronze
+    parsed_df.write \
         .format("iceberg") \
         .mode("append") \
         .saveAsTable(output_table)
 
-    print(f"Successfully processed X12 batch from {input_path} into {output_table}")
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_path", required=True, help="Path to raw X12 files (e.g., s3://...)")
+    parser.add_argument("--output_table", required=True, help="Iceberg table name")
+    args = parser.parse_args()
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: x12_batch_parser.py <input_s3_path> <output_iceberg_table>")
-        sys.exit(1)
+    spark = SparkSession.builder \
+        .appName("X12_Batch_Parser") \
+        .getOrCreate()
 
-    input_path = sys.argv[1]
-    output_table = sys.argv[2]
-
-    spark = get_spark_session()
-    process_x12_batch(spark, input_path, output_table)
-
-if __name__ == "__main__":
-    main()
+    parse_x12(spark, args.input_path, args.output_table)

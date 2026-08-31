@@ -1,74 +1,121 @@
-from airflow import DAG
-from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
-from airflow.providers.dbt.cloud.operators.dbt import DbtCloudRunJobOperator
+import os
 from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.providers.amazon.aws.operators.emr import EmrServerlessStartJobOperator
+from airflow.providers.dbt.cloud.operators.dbt import DbtCloudRunJobOperator
 
-# EHDIP Orchestration DAG for Batch Processing
 default_args = {
-    'owner': 'ehdip_engineering',
+    'owner': 'ehdip_data_engineering',
     'depends_on_past': False,
-    'start_date': datetime(2023, 1, 1),
     'email_on_failure': True,
     'email_on_retry': False,
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
 }
 
+# OpenLineage configuration is typically managed via Airflow's core configurations
+# or via specific connection setups in MWAA. By utilizing standard operators,
+# Airflow will emit metadata automatically to the configured OpenLineage backend.
+
 with DAG(
     'ehdip_end_to_end_pipeline',
     default_args=default_args,
-    description='EHDIP Data Pipeline: Bronze -> Silver -> DQ -> Gold',
+    description='EHDIP Pipeline: Batch -> De-id -> Silver OMOP -> DQ -> DLQ -> Gold dbt',
     schedule_interval=timedelta(days=1),
+    start_date=datetime(2023, 1, 1),
     catchup=False,
-    tags=['ehdip', 'production'],
-    # OpenLineage integration is typically configured at the Airflow cluster level
-    # (e.g. MWAA environment variables for AIRFLOW__LINEAGE__BACKEND)
+    tags=['ehdip', 'production', 'medallion', 'openlineage'],
 ) as dag:
 
-    # 1. Ingestion to Bronze (Batch X12 as an example)
-    ingest_bronze = SparkSubmitOperator(
-        task_id='ingest_to_bronze',
-        application='src/ingestion/x12_batch_parser.py',
-        application_args=['s3://ehdip-landing/x12/latest/', 'glue_catalog.ehdip_data_lake.bronze_raw_payloads'],
-        conf={'spark.openlineage.namespace': 'ehdip-prod'}
+    # 1. Ingest (Batch X12)
+    ingest_batch = EmrServerlessStartJobOperator(
+        task_id='ingest_x12_batch',
+        application_id=os.environ.get('EMR_SERVERLESS_APP_ID'),
+        execution_role_arn=os.environ.get('EMR_SERVERLESS_ROLE_ARN'),
+        job_driver={
+            'sparkSubmit': {
+                'entryPoint': 's3://ehdip-scripts/ingestion/x12_batch_parser.py',
+                'entryPointArguments': [
+                    '--input-path', 's3://ehdip-raw-landing/x12/',
+                    '--table', 'raw_payloads'
+                ]
+            }
+        },
     )
 
-    # 2. De-identification
-    deidentify_phi = SparkSubmitOperator(
+    # 2. De-Identify (FPE and Date-Shifting)
+    deidentify = EmrServerlessStartJobOperator(
         task_id='deidentify_phi',
-        application='src/security/deid_engine.py',
-        application_args=['glue_catalog.ehdip_data_lake.bronze_raw_payloads', 'glue_catalog.ehdip_data_lake.bronze_deid_payloads'],
-        conf={'spark.openlineage.namespace': 'ehdip-prod'}
+        application_id=os.environ.get('EMR_SERVERLESS_APP_ID'),
+        execution_role_arn=os.environ.get('EMR_SERVERLESS_ROLE_ARN'),
+        job_driver={
+            'sparkSubmit': {
+                'entryPoint': 's3://ehdip-scripts/security/deid_engine.py',
+                'entryPointArguments': [
+                    '--input-table', 'raw_payloads',
+                    '--output-table', 'deid_payloads'
+                ]
+            }
+        },
     )
 
-    # 3. OMOP Transformation (Silver)
-    transform_silver = SparkSubmitOperator(
+    # 3. Transform to Silver OMOP v5.4
+    silver_omop = EmrServerlessStartJobOperator(
         task_id='transform_silver_omop',
-        application='src/transformation/omop_silver_transformer.py',
-        application_args=['glue_catalog.ehdip_data_lake.bronze_deid_payloads', 'glue_catalog.ehdip_data_lake'],
-        conf={'spark.openlineage.namespace': 'ehdip-prod'}
+        application_id=os.environ.get('EMR_SERVERLESS_APP_ID'),
+        execution_role_arn=os.environ.get('EMR_SERVERLESS_ROLE_ARN'),
+        job_driver={
+            'sparkSubmit': {
+                'entryPoint': 's3://ehdip-scripts/transformation/omop_silver_transformer.py',
+                'entryPointArguments': [
+                    '--input-table', 'deid_payloads',
+                    '--silver-database', 'ehdip_silver_db',
+                    '--output-table', 'condition_occurrence_raw'
+                ]
+            }
+        },
     )
 
     # 4. Data Quality & DLQ Routing
-    data_quality_check = SparkSubmitOperator(
-        task_id='data_quality_validation',
-        application='src/quality/dq_circuit_breaker.py',
-        application_args=[
-            'glue_catalog.ehdip_data_lake.condition_occurrence',
-            'glue_catalog.ehdip_data_lake.condition_occurrence_valid',
-            'glue_catalog.ehdip_data_lake.condition_occurrence_dlq'
-        ],
-        conf={'spark.openlineage.namespace': 'ehdip-prod'}
+    data_quality = EmrServerlessStartJobOperator(
+        task_id='data_quality_and_dlq',
+        application_id=os.environ.get('EMR_SERVERLESS_APP_ID'),
+        execution_role_arn=os.environ.get('EMR_SERVERLESS_ROLE_ARN'),
+        job_driver={
+            'sparkSubmit': {
+                'entryPoint': 's3://ehdip-scripts/quality/dq_circuit_breaker.py',
+                'entryPointArguments': [
+                    '--input-table', 'condition_occurrence_raw', # Assumed intermediate
+                    '--valid-table', 'condition_occurrence_valid',
+                    '--dlq-table', 'condition_occurrence_dlq'
+                ]
+            }
+        },
     )
 
-    # 5. Run dbt Gold Models (Using dbt Cloud as an example in a modern stack)
-    # Alternatively, could be a BashOperator running dbt-core
-    run_dbt_gold = DbtCloudRunJobOperator(
-        task_id="run_dbt_gold_marts",
-        job_id=12345, # Simulated Job ID
-        check_interval=30,
-        timeout=300
+    # 5. Incremental Merge (Upsert)
+    incremental_merge = EmrServerlessStartJobOperator(
+        task_id='incremental_merge_silver',
+        application_id=os.environ.get('EMR_SERVERLESS_APP_ID'),
+        execution_role_arn=os.environ.get('EMR_SERVERLESS_ROLE_ARN'),
+        job_driver={
+            'sparkSubmit': {
+                'entryPoint': 's3://ehdip-scripts/transformation/incremental_merge.py',
+                'entryPointArguments': [
+                    '--source-table', 'condition_occurrence_valid',
+                    '--target-table', 'condition_occurrence'
+                ]
+            }
+        },
+    )
+
+    # 6. Build Gold dbt Marts (Snowflake)
+    # Using dbt Cloud runner as typical in modern data stacks
+    build_gold_marts = DbtCloudRunJobOperator(
+        task_id='build_gold_dbt_marts',
+        dbt_cloud_conn_id='dbt_cloud_default',
+        job_id=12345 # ID configured in dbt Cloud for ehdip-gold-job
     )
 
     # Define Dependencies
-    ingest_bronze >> deidentify_phi >> transform_silver >> data_quality_check >> run_dbt_gold
+    ingest_batch >> deidentify >> silver_omop >> data_quality >> incremental_merge >> build_gold_marts

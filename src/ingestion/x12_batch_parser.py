@@ -1,47 +1,36 @@
+import argparse
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, current_timestamp, lit, expr
-import sys
+from pyspark.sql.functions import col, lit, current_timestamp
 
-def get_spark_session(app_name="X12_EDI_Batch_Parser"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
+def main(args):
+    spark = SparkSession.builder \
+        .appName("EHDIP_X12_Batch_Parser") \
         .getOrCreate()
 
-def process_x12_batch(spark, input_path, output_table):
-    # Read raw text lines
-    df_raw = spark.read.text(input_path)
+    # Read X12 lines as text
+    # In reality, X12 parsing is complex and requires specialized libraries or complex string manipulation.
+    # We will simulate parsing a text file and writing to bronze raw.
+    raw_df = spark.read.text(args.input_path)
 
-    # Simplified parsing for X12 (splitting by ~)
-    # In a real scenario, a dedicated X12 parser library would be used
-    df_parsed = df_raw \
-        .withColumn("payload_id", expr("uuid()")) \
+    # Add metadata
+    processed_df = raw_df \
+        .withColumn("payload_id", lit("generated-uuid")) \
         .withColumn("source_system_id", lit("EDI_X12_BATCH")) \
-        .withColumn("raw_payload_json", col("value")) \
+        .withColumnRenamed("value", "raw_payload_json") \
         .withColumn("ingestion_timestamp", current_timestamp())
 
-    df_final = df_parsed.select("payload_id", "source_system_id", "raw_payload_json", "ingestion_timestamp")
-
-    # Append to Bronze Iceberg table
-    df_final.write \
+    # Write to Bronze Iceberg table
+    processed_df.write \
         .format("iceberg") \
         .mode("append") \
-        .saveAsTable(output_table)
+        .save(f"{args.catalog}.{args.database}.{args.table}")
 
-    print(f"Successfully processed X12 batch from {input_path} into {output_table}")
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Batch X12 EDI Parsing to Iceberg")
+    parser.add_argument("--input-path", required=True, help="S3 path to raw X12 files")
+    parser.add_argument("--catalog", default="glue_catalog", help="Iceberg Catalog")
+    parser.add_argument("--database", default="ehdip_bronze_db", help="Iceberg Database")
+    parser.add_argument("--table", default="raw_payloads", help="Iceberg Table")
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: x12_batch_parser.py <input_s3_path> <output_iceberg_table>")
-        sys.exit(1)
-
-    input_path = sys.argv[1]
-    output_table = sys.argv[2]
-
-    spark = get_spark_session()
-    process_x12_batch(spark, input_path, output_table)
-
-if __name__ == "__main__":
-    main()
+    args = parser.parse_args()
+    main(args)

@@ -1,84 +1,75 @@
+import os
+import argparse
+import hashlib
+from datetime import timedelta
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, sha2, date_add, udf, regexp_replace, expr
-from pyspark.sql.types import StringType
-import re
-import sys
+from pyspark.sql.functions import col, udf, lit, regexp_replace
+from pyspark.sql.types import StringType, DateType
 
-def get_spark_session(app_name="PHI_DeID_Engine"):
-    return SparkSession.builder \
-        .appName(app_name) \
+# Memory states: "Format-Preserving Encryption (FPE) for PHI uses salted hashes sourced from environment variables (e.g., EHDIP_HASH_SALT) rather than unsalted hashing."
+salt = os.environ.get("EHDIP_HASH_SALT", "default_salt")
+
+def fpe_hash_udf(val):
+    if not val: return None
+    # Simulated Format Preserving Encryption using salted hash for MRN/SSN
+    h = hashlib.sha256(f"{val}{salt}".encode('utf-8')).hexdigest()
+    return f"DEID-{h[:10]}"
+
+def date_shift_udf(val, pid):
+    if not val or not pid: return None
+    # Deterministic date-shifting based on patient ID modulo using a stable hash
+    # Shift between -30 and +30 days
+    stable_hash = int(hashlib.sha256(pid.encode('utf-8')).hexdigest(), 16)
+    shift_days = (stable_hash % 61) - 30
+    return val + timedelta(days=shift_days)
+
+fpe_hash = udf(fpe_hash_udf, StringType())
+date_shift = udf(date_shift_udf, DateType())
+
+def main(args):
+    spark = SparkSession.builder \
+        .appName("EHDIP_DEID_Engine") \
         .getOrCreate()
 
-# Simulated Format-Preserving Encryption (FPE) using SHA-256 for demonstration
-# In reality, you would use a dedicated FPE library that maintains format (e.g. NIST FF1/FF3)
-def simulate_fpe(value):
-    if not value: return value
-    import hashlib
-    # Simple hash for demo
-    return hashlib.sha256(value.encode('utf-8')).hexdigest()[:len(value)]
-
-fpe_udf = udf(simulate_fpe, StringType())
-
-def safe_harbor_redact(text_col):
-    # Regex to redact potential phone numbers or SSNs from free text (Safe Harbor 18)
-    pattern = r'\b(\d{3}-\d{2}-\d{4}|\d{3}-\d{3}-\d{4})\b'
-    return regexp_replace(text_col, pattern, '[REDACTED]')
-
-def deterministic_shift_days(patient_id):
-    if not patient_id: return 0
-    import hashlib
-    # Modulo arithmetic to generate a shift between -30 and 30 days based on patient_id
-    hash_val = int(hashlib.md5(patient_id.encode('utf-8')).hexdigest(), 16)
-    return (hash_val % 61) - 30
-
-shift_udf = udf(deterministic_shift_days, StringType())
-
-def apply_deid_rules(df, patient_id_col, ssn_col, mrn_col, dob_col, notes_col):
-    """
-    Applies de-identification rules:
-    - FPE on SSN and MRN
-    - Deterministic date-shifting (+/- 30 days) on DOB based on Patient ID
-    - Safe Harbor 18 redaction on Notes
-    """
-    if ssn_col in df.columns:
-        df = df.withColumn(f"{ssn_col}_deid", fpe_udf(col(ssn_col)))
-
-    if mrn_col in df.columns:
-        df = df.withColumn(f"{mrn_col}_deid", fpe_udf(col(mrn_col)))
-
-    if dob_col in df.columns and patient_id_col in df.columns:
-        # Deterministic Date shift: +/- 30 days based on patient ID
-        df = df.withColumn("shift_days", shift_udf(col(patient_id_col)).cast("int"))
-        df = df.withColumn(f"{dob_col}_deid", expr(f"date_add({dob_col}, shift_days)"))
-        df = df.drop("shift_days")
-
-    if notes_col in df.columns:
-        df = df.withColumn(f"{notes_col}_deid", safe_harbor_redact(col(notes_col)))
-
-    return df
-
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: deid_engine.py <input_table> <output_table>")
-        sys.exit(1)
-
-    input_table = sys.argv[1]
-    output_table = sys.argv[2]
-
-    spark = get_spark_session()
-
-    df = spark.read.table(input_table)
-
-    # Assume schema has patient_id, ssn, mrn, dob, clinical_notes columns
-    df_deid = apply_deid_rules(df, "patient_id", "ssn", "mrn", "dob", "clinical_notes")
-
-    # Save the de-identified dataframe
-    df_deid.write \
+    # Read from Bronze (assuming we extracted JSON payload to columns for processing)
+    df = spark.read \
         .format("iceberg") \
-        .mode("overwrite") \
-        .saveAsTable(output_table)
+        .load(f"{args.catalog}.{args.database}.{args.input_table}")
 
-    print(f"De-identification complete. Output written to {output_table}")
+    # Safe Harbor 18: removing explicit names, exact dates > 89 years etc.
+    # We will simulate applying FPE and Date Shifting
 
-if __name__ == "__main__":
-    main()
+    # We assume 'df' has been flattened or we are applying this to specific columns
+    # Example logic applied to specific columns if they existed
+    if "patient_ssn" in df.columns:
+        df = df.withColumn("patient_ssn_deid", fpe_hash(col("patient_ssn")))
+
+    if "patient_mrn" in df.columns:
+        df = df.withColumn("patient_mrn_deid", fpe_hash(col("patient_mrn")))
+
+    if "admission_date" in df.columns and "patient_id" in df.columns:
+        df = df.withColumn("admission_date_shifted", date_shift(col("admission_date"), col("patient_id")))
+
+    # Free-text Safe Harbor redaction (Simulated regex)
+    if "clinical_notes" in df.columns:
+        # Simple regex simulation for phone numbers or specific patterns
+        df = df.withColumn("clinical_notes_redacted", regexp_replace(col("clinical_notes"), r'\d{3}-\d{2}-\d{4}', '[REDACTED_SSN]'))
+
+    # Drop the original PHI columns to prevent leakage
+    df = df.drop("patient_ssn", "patient_mrn", "admission_date")
+
+    # Save to intermediate or directly to Silver (depending on pipeline step)
+    df.write \
+        .format("iceberg") \
+        .mode("append") \
+        .save(f"{args.catalog}.{args.database}.{args.output_table}")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="De-Identification Engine")
+    parser.add_argument("--catalog", default="glue_catalog", help="Iceberg Catalog")
+    parser.add_argument("--database", default="ehdip_bronze_db", help="Iceberg Database")
+    parser.add_argument("--input-table", required=True, help="Input Table")
+    parser.add_argument("--output-table", required=True, help="Output Table")
+
+    args = parser.parse_args()
+    main(args)

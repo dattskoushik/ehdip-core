@@ -1,44 +1,46 @@
+import argparse
 from pyspark.sql import SparkSession
-import sys
 
-def get_spark_session(app_name="Incremental_CDC_Merge"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
+def main(args):
+    # Enable Iceberg extensions for Spark SQL
+    spark = SparkSession.builder \
+        .appName("EHDIP_Incremental_Merge") \
         .getOrCreate()
 
-def merge_cdc(spark, cdc_view, target_table):
-    """
-    Performs an incremental MERGE INTO target_table using cdc_view data.
-    Assumes cdc_view has _cdc_op ('c', 'u', 'd') and updated_at to resolve out-of-order events.
-    """
-    merge_sql = f"""
-    MERGE INTO {target_table} t
-    USING {cdc_view} s
-    ON t.payload_id = s.payload_id
-    WHEN MATCHED AND s._cdc_op = 'd' AND s.updated_at >= t.updated_at THEN
+    # Read incremental valid batch (from De-id or OMOP transform)
+    incremental_df = spark.read \
+        .format("iceberg") \
+        .load(f"{args.catalog}.{args.database}.{args.source_table}")
+
+    # Register DataFrame as a temporary view to use in MERGE INTO SQL
+    incremental_df.createOrReplaceTempView("updates")
+
+    # Perform Idempotent MERGE INTO
+    # Assuming 'condition_occurrence_id' is the primary key and 'updated_at' resolves out-of-order CDC
+    # Memory context: For Apache Iceberg tables in PySpark, enforce idempotent writes by registering DataFrames as temporary views and executing MERGE INTO SQL queries instead of using .mode('append').
+
+    merge_query = f"""
+    MERGE INTO {args.catalog}.{args.target_database}.{args.target_table} t
+    USING updates s
+    ON t.condition_occurrence_id = s.condition_occurrence_id
+    WHEN MATCHED AND s.cdc_op = 'd' AND s.updated_at > t.updated_at THEN
         DELETE
-    WHEN MATCHED AND s._cdc_op IN ('c', 'u') AND s.updated_at >= t.updated_at THEN
+    WHEN MATCHED AND (s.cdc_op = 'u' OR s.cdc_op IS NULL) AND s.updated_at > t.updated_at THEN
         UPDATE SET *
-    WHEN NOT MATCHED AND s._cdc_op IN ('c', 'u') THEN
+    WHEN NOT MATCHED AND (s.cdc_op = 'c' OR s.cdc_op = 'u' OR s.cdc_op IS NULL) THEN
         INSERT *
     """
 
-    spark.sql(merge_sql)
-    print(f"Merge operation completed on {target_table}")
+    spark.sql(merge_query)
+    print("Incremental MERGE completed successfully.")
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: incremental_merge.py <cdc_temp_view> <target_iceberg_table>")
-        sys.exit(1)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Incremental Merge / Upsert Engine")
+    parser.add_argument("--catalog", default="glue_catalog", help="Iceberg Catalog")
+    parser.add_argument("--database", default="ehdip_silver_db", help="Source Database")
+    parser.add_argument("--source-table", required=True, help="Source Table")
+    parser.add_argument("--target-database", default="ehdip_silver_db", help="Target Database")
+    parser.add_argument("--target-table", required=True, help="Target Table")
 
-    cdc_view = sys.argv[1]
-    target_table = sys.argv[2]
-
-    spark = get_spark_session()
-    merge_cdc(spark, cdc_view, target_table)
-
-if __name__ == "__main__":
-    main()
+    args = parser.parse_args()
+    main(args)

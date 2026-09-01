@@ -1,68 +1,67 @@
-import sys
+import os
+import argparse
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, current_timestamp, expr
-from pyspark.sql.types import StructType, StructField, StringType, MapType
+from pyspark.sql.functions import col, from_json, current_timestamp
+from pyspark.sql.types import StructType, StructField, StringType
 
-def get_spark_session(app_name="StreamingFHIR_Ingestion"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
+def main(args):
+    spark = SparkSession.builder \
+        .appName("EHDIP_Streaming_FHIR_Ingestion") \
         .getOrCreate()
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: streaming_fhir.py <kafka_bootstrap_servers> <kafka_topic>")
-        sys.exit(1)
-
-    kafka_bootstrap_servers = sys.argv[1]
-    kafka_topic = sys.argv[2]
-
-    spark = get_spark_session()
-
-    # Define schema for incoming FHIR JSON (simplified for dynamic payload)
-    # Using MapType to handle schema evolution naturally or string to hold raw JSON
-    schema = StructType([
+    # Define simple schema for FHIR R4 JSON
+    # In production, a schema registry or fully evolved schema might be used
+    fhir_schema = StructType([
+        StructField("resourceType", StringType(), True),
         StructField("id", StringType(), True),
-        StructField("resourceType", StringType(), True)
+        # Assuming rest of payload can be cast or kept as string and evolved
+        StructField("payload", StringType(), True)
     ])
 
-    # Read from Kafka/MSK
-    df_stream = spark.readStream \
+    # Read stream from MSK
+    # MSK configuration includes SASL/SCRAM authentication
+    kafka_df = spark \
+        .readStream \
         .format("kafka") \
-        .option("kafka.bootstrap.servers", kafka_bootstrap_servers) \
-        .option("subscribe", kafka_topic) \
+        .option("kafka.bootstrap.servers", args.kafka_bootstrap_servers) \
+        .option("subscribe", args.kafka_topic) \
         .option("kafka.security.protocol", "SASL_SSL") \
         .option("kafka.sasl.mechanism", "SCRAM-SHA-512") \
+        .option("kafka.sasl.jaas.config", f"org.apache.kafka.common.security.scram.ScramLoginModule required username=\"{os.environ.get('MSK_USER')}\" password=\"{os.environ.get('MSK_PASS')}\";") \
         .option("startingOffsets", "earliest") \
         .load()
 
-    # Parse JSON payload and construct audit fields
-    # Keep the raw payload JSON to support schema evolution
-    parsed_df = df_stream \
-        .selectExpr("CAST(value AS STRING) as raw_payload_json") \
-        .withColumn("ingestion_timestamp", current_timestamp()) \
-        .withColumn("source_system_id", expr("'AWS_MSK_FHIR_TOPIC'")) \
-        .withColumn("payload_id", expr("uuid()"))
-
-    # Select columns matching the Bronze schema
-    final_df = parsed_df.select(
-        "payload_id",
-        "source_system_id",
-        "raw_payload_json",
-        "ingestion_timestamp"
-    )
+    # Parse JSON from Kafka value
+    parsed_df = kafka_df.selectExpr("CAST(value AS STRING) as json_str") \
+        .withColumn("data", from_json(col("json_str"), fhir_schema)) \
+        .select(
+            col("data.id").alias("payload_id"),
+            col("data.resourceType").alias("source_system_id"),
+            col("json_str").alias("raw_payload_json"),
+            current_timestamp().alias("ingestion_timestamp")
+        )
 
     # Write stream to Iceberg Bronze table
-    query = final_df.writeStream \
+    # Schema evolution could be configured at the iceberg level via mergeSchema option
+    query = parsed_df \
+        .writeStream \
         .format("iceberg") \
         .outputMode("append") \
         .trigger(processingTime="1 minute") \
-        .option("checkpointLocation", "s3://ehdip-bronze-raw/checkpoints/fhir_ingestion/") \
-        .toTable("glue_catalog.ehdip_data_lake.bronze_raw_payloads")
+        .option("path", f"{args.catalog}.{args.database}.{args.table}") \
+        .option("checkpointLocation", args.checkpoint_dir) \
+        .start()
 
     query.awaitTermination()
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Streaming FHIR Ingestion to Iceberg")
+    parser.add_argument("--kafka-bootstrap-servers", required=True, help="MSK Bootstrap Servers")
+    parser.add_argument("--kafka-topic", required=True, help="Kafka Topic")
+    parser.add_argument("--catalog", default="glue_catalog", help="Iceberg Catalog")
+    parser.add_argument("--database", default="ehdip_bronze_db", help="Iceberg Database")
+    parser.add_argument("--table", default="raw_payloads", help="Iceberg Table")
+    parser.add_argument("--checkpoint-dir", required=True, help="Checkpoint Directory for Structured Streaming")
+
+    args = parser.parse_args()
+    main(args)

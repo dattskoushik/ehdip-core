@@ -1,60 +1,54 @@
+import argparse
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, current_timestamp
-import sys
+from pyspark.sql.functions import col, lit
 
-def get_spark_session(app_name="OMOP_Silver_Transformer"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
+def main(args):
+    spark = SparkSession.builder \
+        .appName("EHDIP_OMOP_Silver_Transformer") \
         .getOrCreate()
 
-def transform_to_omop(spark, input_table, output_database):
-    """
-    Transforms de-identified bronze payload to OMOP CDM v5.4 structure.
-    Simplified version focusing on structural mapping.
-    """
-    df_bronze = spark.read.table(input_table)
+    # Read from Bronze (or De-id intermediate)
+    raw_df = spark.read \
+        .format("iceberg") \
+        .load(f"{args.catalog}.{args.database}.{args.input_table}")
 
-    # 1. Map to condition_occurrence
-    # Assuming json parsing has already extracted relevant fields into columns
-    # like 'patient_id', 'condition_concept_id', 'condition_start_date'
-    if "condition_concept_id" in df_bronze.columns:
-        condition_df = df_bronze.select(
+    # Standardize to OMOP CDM v5.4
+    # In a real scenario, this involves complex mapping using Athena vocabularies
+    # Here we simulate the structural transformation for some OMOP tables
+
+    # Example: Condition Occurrence Table
+    condition_occurrence_df = raw_df \
+        .select(
             col("payload_id").alias("condition_occurrence_id"),
-            col("patient_id").alias("person_id"),
-            col("condition_concept_id"),
-            col("condition_start_date"),
-            col("condition_end_date"),
-            lit(32020).alias("condition_type_concept_id") # EHR
+            col("patient_mrn_deid").alias("person_id"), # Linked person_id
+            lit(0).alias("condition_concept_id"), # Requires Athena lookup
+            col("admission_date_shifted").alias("condition_start_date"),
+            col("admission_date_shifted").alias("condition_start_datetime"),
+            lit(None).cast("date").alias("condition_end_date"),
+            lit(None).cast("timestamp").alias("condition_end_datetime"),
+            lit(32020).alias("condition_type_concept_id"), # EHR encounter diagnosis
+            col("source_system_id").alias("condition_source_value"),
+            lit(0).alias("condition_source_concept_id"),
+            lit(None).cast("string").alias("condition_status_source_value"),
+            lit(0).alias("condition_status_concept_id")
         )
-        condition_df.write.format("iceberg").mode("append").saveAsTable(f"{output_database}.condition_occurrence")
 
-    # 2. Map to drug_exposure
-    if "drug_concept_id" in df_bronze.columns:
-        drug_df = df_bronze.select(
-            col("payload_id").alias("drug_exposure_id"),
-            col("patient_id").alias("person_id"),
-            col("drug_concept_id"),
-            col("drug_exposure_start_date"),
-            col("drug_exposure_end_date"),
-            lit(38000177).alias("drug_type_concept_id") # Prescription written
-        )
-        drug_df.write.format("iceberg").mode("append").saveAsTable(f"{output_database}.drug_exposure")
+    # Note: splink linkage logic for person_id resolution would typically happen
+    # prior to or during this step to ensure all records map to a unified person_id.
+    # We write to the silver zone
 
-    print(f"Successfully transformed and loaded OMOP tables to {output_database}")
+    condition_occurrence_df.write \
+        .format("iceberg") \
+        .mode("append") \
+        .save(f"{args.catalog}.{args.silver_database}.{args.output_table}")
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: omop_silver_transformer.py <input_bronze_table> <output_silver_db>")
-        sys.exit(1)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Silver Standardization to OMOP CDM v5.4")
+    parser.add_argument("--catalog", default="glue_catalog", help="Iceberg Catalog")
+    parser.add_argument("--database", default="ehdip_bronze_db", help="Source Database")
+    parser.add_argument("--input-table", required=True, help="Input Table")
+    parser.add_argument("--silver-database", default="ehdip_silver_db", help="Silver Database")
+    parser.add_argument("--output-table", default="condition_occurrence", help="Target table")
 
-    input_table = sys.argv[1]
-    output_database = sys.argv[2]
-
-    spark = get_spark_session()
-    transform_to_omop(spark, input_table, output_database)
-
-if __name__ == "__main__":
-    main()
+    args = parser.parse_args()
+    main(args)

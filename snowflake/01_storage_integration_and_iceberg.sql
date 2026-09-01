@@ -1,64 +1,54 @@
--- Day 8: Snowflake Storage Integration & Dynamic Tables
-
--- 1. Create AWS IAM Storage Integration
-CREATE STORAGE INTEGRATION s3_ehdip_integration
+-- 1. Create Storage Integration for AWS S3
+CREATE OR REPLACE STORAGE INTEGRATION ehdip_s3_int
   TYPE = EXTERNAL_STAGE
   STORAGE_PROVIDER = 'S3'
   ENABLED = TRUE
-  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::123456789012:role/snowflake_ehdip_role'
-  STORAGE_ALLOWED_LOCATIONS = ('s3://ehdip-silver-standardized/', 's3://ehdip-gold-marts/');
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::123456789012:role/snowflake-s3-access-role'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://ehdip-silver-zone/', 's3://ehdip-gold-zone/');
 
--- 2. Create External Volume for Iceberg
-CREATE EXTERNAL VOLUME ehdip_iceberg_vol
+-- 2. Create Catalog Integration for AWS Glue
+CREATE OR REPLACE CATALOG INTEGRATION ehdip_glue_int
+  CATALOG_SOURCE = GLUE
+  CATALOG_NAMESPACE = 'ehdip_silver_db'
+  TABLE_FORMAT = ICEBERG
+  GLUE_AWS_ROLE_ARN = 'arn:aws:iam::123456789012:role/snowflake-glue-access-role'
+  GLUE_CATALOG_ID = '123456789012'
+  ENABLED = TRUE;
+
+-- 3. Create External Volume for Iceberg Storage
+CREATE OR REPLACE EXTERNAL VOLUME ehdip_ext_vol
   STORAGE_LOCATIONS =
     (
       (
-        NAME = 'us-east-1-silver'
+        NAME = 'ehdip-silver-us-east-1'
         STORAGE_PROVIDER = 'S3'
-        STORAGE_BASE_URL = 's3://ehdip-silver-standardized/'
-        STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::123456789012:role/snowflake_ehdip_role'
+        STORAGE_BASE_URL = 's3://ehdip-silver-zone/'
+        STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::123456789012:role/snowflake-s3-access-role'
       )
     );
 
--- 3. Create External Catalog Integration (AWS Glue)
-CREATE CATALOG INTEGRATION glue_ehdip_catalog
-  CATALOG_SOURCE = GLUE
-  CATALOG_NAMESPACE = 'ehdip_data_lake'
-  TABLE_FORMAT = ICEBERG
-  GLUE_AWS_ROLE_ARN = 'arn:aws:iam::123456789012:role/snowflake_glue_role'
-  GLUE_CATALOG_ID = '123456789012'
-  GLUE_REGION = 'us-east-1'
-  ENABLED = TRUE;
-
--- 4. Create Iceberg Table over Silver S3 data
-CREATE ICEBERG TABLE silver_condition_occurrence
-  EXTERNAL_VOLUME = 'ehdip_iceberg_vol'
-  CATALOG = 'glue_ehdip_catalog'
+-- 4. Create Iceberg Table linked to Silver Zone
+CREATE OR REPLACE ICEBERG TABLE condition_occurrence
+  EXTERNAL_VOLUME = 'ehdip_ext_vol'
+  CATALOG = 'ehdip_glue_int'
   CATALOG_TABLE_NAME = 'condition_occurrence';
 
-CREATE ICEBERG TABLE silver_drug_exposure
-  EXTERNAL_VOLUME = 'ehdip_iceberg_vol'
-  CATALOG = 'glue_ehdip_catalog'
-  CATALOG_TABLE_NAME = 'drug_exposure';
-
 -- 5. Create Dynamic Tables with Target Lags
--- 5 min lag for Silver intermediate models
-CREATE DYNAMIC TABLE dt_silver_recent_conditions
+-- Silver Dynamic Table (5 min lag)
+CREATE OR REPLACE DYNAMIC TABLE condition_occurrence_silver_dt
   TARGET_LAG = '5 minutes'
-  WAREHOUSE = 'ehdip_transform_wh'
+  WAREHOUSE = ehdip_wh
   AS
-  SELECT person_id, condition_concept_id, condition_start_date
-  FROM silver_condition_occurrence
-  WHERE condition_start_date >= CURRENT_DATE() - INTERVAL '30 DAYS';
+  SELECT * FROM condition_occurrence;
 
--- 60 min lag for Gold Marts
-CREATE DYNAMIC TABLE dt_gold_patient_summary
+-- Gold Dynamic Table (60 min lag)
+CREATE OR REPLACE DYNAMIC TABLE readmissions_30_day_dt
   TARGET_LAG = '60 minutes'
-  WAREHOUSE = 'ehdip_transform_wh'
+  WAREHOUSE = ehdip_wh
   AS
   SELECT
     person_id,
-    COUNT(DISTINCT condition_concept_id) as total_conditions,
-    MAX(condition_start_date) as last_condition_date
-  FROM silver_condition_occurrence
+    COUNT(condition_occurrence_id) as admission_count
+  FROM condition_occurrence_silver_dt
+  -- Simulation of a readmissions aggregate logic
   GROUP BY person_id;

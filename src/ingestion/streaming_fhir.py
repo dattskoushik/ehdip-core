@@ -1,68 +1,51 @@
-import sys
+import argparse
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, current_timestamp, expr
-from pyspark.sql.types import StructType, StructField, StringType, MapType
+from pyspark.sql.functions import col, from_json, current_timestamp
+from pyspark.sql.types import StructType, StructField, StringType
 
-def get_spark_session(app_name="StreamingFHIR_Ingestion"):
-    return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.type", "glue") \
+def main(kafka_brokers, kafka_topic, iceberg_table, checkpoint_location):
+    spark = SparkSession.builder \
+        .appName("FHIR Streaming Ingestion") \
         .getOrCreate()
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: streaming_fhir.py <kafka_bootstrap_servers> <kafka_topic>")
-        sys.exit(1)
-
-    kafka_bootstrap_servers = sys.argv[1]
-    kafka_topic = sys.argv[2]
-
-    spark = get_spark_session()
-
-    # Define schema for incoming FHIR JSON (simplified for dynamic payload)
-    # Using MapType to handle schema evolution naturally or string to hold raw JSON
-    schema = StructType([
-        StructField("id", StringType(), True),
-        StructField("resourceType", StringType(), True)
-    ])
-
-    # Read from Kafka/MSK
-    df_stream = spark.readStream \
+    # Kafka connection and properties (mocked for Serverless / SASL SCRAM)
+    df = spark \
+        .readStream \
         .format("kafka") \
-        .option("kafka.bootstrap.servers", kafka_bootstrap_servers) \
+        .option("kafka.bootstrap.servers", kafka_brokers) \
         .option("subscribe", kafka_topic) \
         .option("kafka.security.protocol", "SASL_SSL") \
         .option("kafka.sasl.mechanism", "SCRAM-SHA-512") \
-        .option("startingOffsets", "earliest") \
         .load()
 
-    # Parse JSON payload and construct audit fields
-    # Keep the raw payload JSON to support schema evolution
-    parsed_df = df_stream \
-        .selectExpr("CAST(value AS STRING) as raw_payload_json") \
+    # Simplified FHIR schema for parsing payload
+    fhir_schema = StructType([
+        StructField("resourceType", StringType(), True),
+        StructField("id", StringType(), True)
+    ])
+
+    parsed_df = df.selectExpr("CAST(key AS STRING)", "CAST(value AS STRING)") \
         .withColumn("ingestion_timestamp", current_timestamp()) \
-        .withColumn("source_system_id", expr("'AWS_MSK_FHIR_TOPIC'")) \
-        .withColumn("payload_id", expr("uuid()"))
+        .withColumn("source_system_id", col("key")) \
+        .withColumn("payload_id", from_json(col("value"), fhir_schema).getField("id")) \
+        .withColumnRenamed("value", "raw_payload_json") \
+        .select("ingestion_timestamp", "source_system_id", "payload_id", "raw_payload_json")
 
-    # Select columns matching the Bronze schema
-    final_df = parsed_df.select(
-        "payload_id",
-        "source_system_id",
-        "raw_payload_json",
-        "ingestion_timestamp"
-    )
-
-    # Write stream to Iceberg Bronze table
-    query = final_df.writeStream \
+    query = parsed_df.writeStream \
         .format("iceberg") \
         .outputMode("append") \
         .trigger(processingTime="1 minute") \
-        .option("checkpointLocation", "s3://ehdip-bronze-raw/checkpoints/fhir_ingestion/") \
-        .toTable("glue_catalog.ehdip_data_lake.bronze_raw_payloads")
+        .option("checkpointLocation", checkpoint_location) \
+        .toTable(iceberg_table)
 
     query.awaitTermination()
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--kafka_brokers', required=True)
+    parser.add_argument('--kafka_topic', required=True)
+    parser.add_argument('--iceberg_table', required=True)
+    parser.add_argument('--checkpoint_location', required=True)
+    args = parser.parse_args()
+
+    main(args.kafka_brokers, args.kafka_topic, args.iceberg_table, args.checkpoint_location)
